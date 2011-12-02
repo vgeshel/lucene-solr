@@ -1,5 +1,7 @@
 package org.apache.lucene.index;
 
+import org.apache.lucene.util.BitVector;
+
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -31,6 +33,7 @@ class ReadOnlySegmentReader extends SegmentReader {
   // Not synchronized
   @Override
   public boolean isDeleted(int n) {
+    final BitVector deletedDocs = getDeletedDocs();
     return deletedDocs != null && deletedDocs.get(n);
   }
 }

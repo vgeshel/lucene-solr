@@ -153,7 +153,7 @@ extends SegmentTermDocs implements TermPositions {
   private void lazySkip() throws IOException {
     if (proxStream == null) {
       // clone lazily
-      proxStream = (IndexInput) parent.core.proxStream.clone();
+      proxStream = (IndexInput) parent.getCore().proxStream.clone();
     }
     
     // we might have to skip the current payload

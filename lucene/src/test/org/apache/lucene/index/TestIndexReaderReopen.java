@@ -1131,7 +1131,7 @@ public class TestIndexReaderReopen extends LuceneTestCase {
     SegmentReader sr2 = (SegmentReader) r2.getSequentialSubReaders()[0]; // and reopened IRs
 
     // At this point they share the same BitVector
-    assertTrue(sr1.deletedDocs==sr2.deletedDocs);
+    assertTrue(sr1.getDeletedDocs()==sr2.getDeletedDocs());
 
     r2.deleteDocument(0);
 
@@ -1139,7 +1139,7 @@ public class TestIndexReaderReopen extends LuceneTestCase {
     assertFalse(r1.isDeleted(0));
 
     // Now r2 should have made a private copy of deleted docs:
-    assertTrue(sr1.deletedDocs!=sr2.deletedDocs);
+    assertTrue(sr1.getDeletedDocs()!=sr2.getDeletedDocs());
 
     r1.close();
     r2.close();
@@ -1166,12 +1166,12 @@ public class TestIndexReaderReopen extends LuceneTestCase {
     SegmentReader sr2 = (SegmentReader) rs2[0];
 
     // At this point they share the same BitVector
-    assertTrue(sr1.deletedDocs==sr2.deletedDocs);
-    final BitVector delDocs = sr1.deletedDocs;
+    assertTrue(sr1.getDeletedDocs()==sr2.getDeletedDocs());
+    final BitVector delDocs = sr1.getDeletedDocs();
     r1.close();
 
     r2.deleteDocument(0);
-    assertTrue(delDocs==sr2.deletedDocs);
+    assertTrue(delDocs==sr2.getDeletedDocs());
     r2.close();
     dir.close();
   }

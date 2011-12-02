@@ -25,9 +25,7 @@ class AllTermDocs extends AbstractAllTermDocs {
 
   protected AllTermDocs(SegmentReader parent) {
     super(parent.maxDoc());
-    synchronized (parent) {
-      this.deletedDocs = parent.deletedDocs;
-    }
+    this.deletedDocs = parent.getDeletedDocs();
   }
 
   @Override

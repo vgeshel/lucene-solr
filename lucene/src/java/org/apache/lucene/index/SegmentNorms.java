@@ -70,15 +70,16 @@ final class SegmentNorms implements Cloneable {
 
   private void closeInput() throws IOException {
     if (in != null) {
-      if (in != owner.singleNormStream) {
+      final IndexInput singleNormStream = owner.getSingleNormStream();
+      if (in != singleNormStream) {
         // It's private to us -- just close it
         in.close();
       } else {
         // We are sharing this with others -- decRef and
         // maybe close the shared norm stream
-        if (owner.singleNormRef.decrementAndGet() == 0) {
-          owner.singleNormStream.close();
-          owner.singleNormStream = null;
+        if (owner.getSingleNormRef().decrementAndGet() == 0) {
+          singleNormStream.close();
+          owner.setSingleNormStream(null);
         }
       }
 

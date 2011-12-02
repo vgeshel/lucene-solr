@@ -46,16 +46,14 @@ class SegmentTermDocs implements TermDocs {
   
   protected SegmentTermDocs(SegmentReader parent) {
     this.parent = parent;
-    this.freqStream = (IndexInput) parent.core.freqStream.clone();
-    synchronized (parent) {
-      this.deletedDocs = parent.deletedDocs;
-    }
-    this.skipInterval = parent.core.getTermsReader().getSkipInterval();
-    this.maxSkipLevels = parent.core.getTermsReader().getMaxSkipLevels();
+    this.freqStream = (IndexInput) parent.getCore().freqStream.clone();
+    this.deletedDocs = parent.getDeletedDocs();
+    this.skipInterval = parent.getCore().getTermsReader().getSkipInterval();
+    this.maxSkipLevels = parent.getCore().getTermsReader().getMaxSkipLevels();
   }
 
   public void seek(Term term) throws IOException {
-    TermInfo ti = parent.core.getTermsReader().get(term);
+    TermInfo ti = parent.getCore().getTermsReader().get(term);
     seek(ti, term);
   }
 
@@ -64,13 +62,13 @@ class SegmentTermDocs implements TermDocs {
     Term term;
     
     // use comparison of fieldinfos to verify that termEnum belongs to the same segment as this SegmentTermDocs
-    if (termEnum instanceof SegmentTermEnum && ((SegmentTermEnum) termEnum).fieldInfos == parent.core.fieldInfos) {        // optimized case
+    if (termEnum instanceof SegmentTermEnum && ((SegmentTermEnum) termEnum).fieldInfos == parent.getCore().fieldInfos) {        // optimized case
       SegmentTermEnum segmentTermEnum = ((SegmentTermEnum) termEnum);
       term = segmentTermEnum.term();
       ti = segmentTermEnum.termInfo();
     } else  {                                         // punt case
       term = termEnum.term();
-      ti = parent.core.getTermsReader().get(term);
+      ti = parent.getCore().getTermsReader().get(term);
     }
     
     seek(ti, term);
@@ -78,7 +76,7 @@ class SegmentTermDocs implements TermDocs {
 
   void seek(TermInfo ti, Term term) throws IOException {
     count = 0;
-    FieldInfo fi = parent.core.fieldInfos.fieldInfo(term.field);
+    FieldInfo fi = parent.getCore().fieldInfos.fieldInfo(term.field);
     indexOptions = (fi != null) ? fi.indexOptions : IndexOptions.DOCS_AND_FREQS_AND_POSITIONS;
     currentFieldStoresPayloads = (fi != null) ? fi.storePayloads : false;
     if (ti == null) {

@@ -29,6 +29,10 @@ import java.util.Map;
 import java.util.Set;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.FieldSelector;
 import org.apache.lucene.search.Similarity;
@@ -52,8 +56,8 @@ public class SegmentReader extends IndexReader implements Cloneable {
   CloseableThreadLocal<FieldsReader> fieldsReaderLocal = new FieldsReaderLocal();
   CloseableThreadLocal<TermVectorsReader> termVectorsLocal = new CloseableThreadLocal<TermVectorsReader>();
 
-  BitVector deletedDocs = null;
-  AtomicInteger deletedDocsRef = null;
+  private BitVector deletedDocs = null;
+  private AtomicInteger deletedDocsRef = null;
   private boolean deletedDocsDirty = false;
   private boolean normsDirty = false;
 
@@ -68,10 +72,45 @@ public class SegmentReader extends IndexReader implements Cloneable {
   private int rollbackPendingDeleteCount;
 
   // optionally used for the .nrm file shared by multiple norms
-  IndexInput singleNormStream;
-  AtomicInteger singleNormRef;
+  private IndexInput singleNormStream;
+  private AtomicInteger singleNormRef;
 
-  SegmentCoreReaders core;
+  final IndexInput getSingleNormStream() {
+    // this was accessed with synchronization before the ReadWriteLock changes
+    return singleNormStream;
+  }
+  
+  final void setSingleNormStream (IndexInput i) {
+    // this was accessed with synchronization before the ReadWriteLock changes
+    this.singleNormStream = i;
+  }
+
+  final AtomicInteger getSingleNormRef() {
+    // this was accessed with synchronization before the ReadWriteLock changes
+    return singleNormRef;
+  }
+
+  private SegmentCoreReaders core;
+  
+  final SegmentCoreReaders getCore() {
+    // this was accessed with synchronization before the ReadWriteLock changes
+    return core;
+  }
+
+  private ReadWriteLock rwLock = new ReentrantReadWriteLock();
+  private Lock readLock = rwLock.readLock();
+  private Lock writeLock = rwLock.writeLock();
+  
+  final BitVector getDeletedDocs() {
+    // this is a replacement for synchronized (parent) { parent.deletedDocs; }
+    readLock.lock();
+    
+    try {
+      return deletedDocs;
+    } finally {
+      readLock.unlock();
+    }
+  }
 
   /**
    * Sets the initial value 
@@ -188,123 +227,133 @@ public class SegmentReader extends IndexReader implements Cloneable {
   }
 
   @Override
-  public final synchronized Object clone() {
+  public final Object clone() {
     try {
-      return clone(readOnly); // Preserve current readOnly
+      readLock.lock();
+
+      try {
+        return clone(readOnly); // Preserve current readOnly
+      } finally {
+        readLock.unlock();
+      }
     } catch (Exception ex) {
       throw new RuntimeException(ex);
     }
   }
 
   @Override
-  public final synchronized IndexReader clone(boolean openReadOnly) throws CorruptIndexException, IOException {
+  public final IndexReader clone(boolean openReadOnly) throws CorruptIndexException, IOException {
     return reopenSegment(si, true, openReadOnly);
   }
 
   @Override
-  protected synchronized IndexReader doOpenIfChanged()
+  protected IndexReader doOpenIfChanged()
     throws CorruptIndexException, IOException {
     return reopenSegment(si, false, readOnly);
   }
 
   @Override
-  protected synchronized IndexReader doOpenIfChanged(boolean openReadOnly)
+  protected IndexReader doOpenIfChanged(boolean openReadOnly)
     throws CorruptIndexException, IOException {
     return reopenSegment(si, false, openReadOnly);
   }
 
-  synchronized SegmentReader reopenSegment(SegmentInfo si, boolean doClone, boolean openReadOnly) throws CorruptIndexException, IOException {
-    ensureOpen();
-    boolean deletionsUpToDate = (this.si.hasDeletions() == si.hasDeletions()) 
-                                  && (!si.hasDeletions() || this.si.getDelFileName().equals(si.getDelFileName()));
-    boolean normsUpToDate = true;
-    
-    boolean[] fieldNormsChanged = new boolean[core.fieldInfos.size()];
-    final int fieldCount = core.fieldInfos.size();
-    for (int i = 0; i < fieldCount; i++) {
-      if (!this.si.getNormFileName(i).equals(si.getNormFileName(i))) {
-        normsUpToDate = false;
-        fieldNormsChanged[i] = true;
-      }
-    }
+  SegmentReader reopenSegment(SegmentInfo si, boolean doClone, boolean openReadOnly) throws CorruptIndexException, IOException {
+    readLock.lock();
 
-    // if we're cloning we need to run through the reopenSegment logic
-    // also if both old and new readers aren't readonly, we clone to avoid sharing modifications
-    if (normsUpToDate && deletionsUpToDate && !doClone && openReadOnly && readOnly) {
-      return null;
-    }    
-
-    // When cloning, the incoming SegmentInfos should not
-    // have any changes in it:
-    assert !doClone || (normsUpToDate && deletionsUpToDate);
-
-    // clone reader
-    SegmentReader clone = openReadOnly ? new ReadOnlySegmentReader() : new SegmentReader();
-
-    boolean success = false;
     try {
-      core.incRef();
-      clone.core = core;
-      clone.readOnly = openReadOnly;
-      clone.si = si;
-      clone.readBufferSize = readBufferSize;
-      clone.pendingDeleteCount = pendingDeleteCount;
-      clone.readerFinishedListeners = readerFinishedListeners;
-
-      if (!openReadOnly && hasChanges) {
-        // My pending changes transfer to the new reader
-        clone.deletedDocsDirty = deletedDocsDirty;
-        clone.normsDirty = normsDirty;
-        clone.hasChanges = hasChanges;
-        hasChanges = false;
-      }
-      
-      if (doClone) {
-        if (deletedDocs != null) {
-          deletedDocsRef.incrementAndGet();
-          clone.deletedDocs = deletedDocs;
-          clone.deletedDocsRef = deletedDocsRef;
-        }
-      } else {
-        if (!deletionsUpToDate) {
-          // load deleted docs
-          assert clone.deletedDocs == null;
-          clone.loadDeletedDocs();
-        } else if (deletedDocs != null) {
-          deletedDocsRef.incrementAndGet();
-          clone.deletedDocs = deletedDocs;
-          clone.deletedDocsRef = deletedDocsRef;
+      ensureOpen();
+      boolean deletionsUpToDate = (this.si.hasDeletions() == si.hasDeletions())
+          && (!si.hasDeletions() || this.si.getDelFileName().equals(
+              si.getDelFileName()));
+      boolean normsUpToDate = true;
+      boolean[] fieldNormsChanged = new boolean[core.fieldInfos.size()];
+      final int fieldCount = core.fieldInfos.size();
+      for (int i = 0; i < fieldCount; i++) {
+        if (!this.si.getNormFileName(i).equals(si.getNormFileName(i))) {
+          normsUpToDate = false;
+          fieldNormsChanged[i] = true;
         }
       }
+      // if we're cloning we need to run through the reopenSegment logic
+      // also if both old and new readers aren't readonly, we clone to avoid sharing modifications
+      if (normsUpToDate && deletionsUpToDate && !doClone && openReadOnly
+          && readOnly) {
+        return null;
+      }
+      // When cloning, the incoming SegmentInfos should not
+      // have any changes in it:
+      assert !doClone || (normsUpToDate && deletionsUpToDate);
+      // clone reader
+      SegmentReader clone = openReadOnly ? new ReadOnlySegmentReader()
+          : new SegmentReader();
+      boolean success = false;
+      try {
+        core.incRef();
+        clone.core = core;
+        clone.readOnly = openReadOnly;
+        clone.si = si;
+        clone.readBufferSize = readBufferSize;
+        clone.pendingDeleteCount = pendingDeleteCount;
+        clone.readerFinishedListeners = readerFinishedListeners;
 
-      clone.norms = new HashMap<String,SegmentNorms>();
+        if (!openReadOnly && hasChanges) {
+          // My pending changes transfer to the new reader
+          clone.deletedDocsDirty = deletedDocsDirty;
+          clone.normsDirty = normsDirty;
+          clone.hasChanges = hasChanges;
+          hasChanges = false;
+        }
 
-      // Clone norms
-      for (int i = 0; i < fieldNormsChanged.length; i++) {
+        if (doClone) {
+          if (deletedDocs != null) {
+            deletedDocsRef.incrementAndGet();
+            clone.deletedDocs = deletedDocs;
+            clone.deletedDocsRef = deletedDocsRef;
+          }
+        } else {
+          if (!deletionsUpToDate) {
+            // load deleted docs
+            assert clone.deletedDocs == null;
+            clone.loadDeletedDocs();
+          } else if (deletedDocs != null) {
+            deletedDocsRef.incrementAndGet();
+            clone.deletedDocs = deletedDocs;
+            clone.deletedDocsRef = deletedDocsRef;
+          }
+        }
 
-        // Clone unchanged norms to the cloned reader
-        if (doClone || !fieldNormsChanged[i]) {
-          final String curField = core.fieldInfos.fieldInfo(i).name;
-          SegmentNorms norm = this.norms.get(curField);
-          if (norm != null)
-            clone.norms.put(curField, (SegmentNorms) norm.clone());
+        clone.norms = new HashMap<String, SegmentNorms>();
+
+        // Clone norms
+        for (int i = 0; i < fieldNormsChanged.length; i++) {
+
+          // Clone unchanged norms to the cloned reader
+          if (doClone || !fieldNormsChanged[i]) {
+            final String curField = core.fieldInfos.fieldInfo(i).name;
+            SegmentNorms norm = this.norms.get(curField);
+            if (norm != null)
+              clone.norms.put(curField, (SegmentNorms) norm.clone());
+          }
+        }
+
+        // If we are not cloning, then this will open anew
+        // any norms that have changed:
+        clone.openNorms(si.getUseCompoundFile() ? core.getCFSReader()
+            : directory(), readBufferSize);
+
+        success = true;
+      } finally {
+        if (!success) {
+          // An exception occurred during reopen, we have to decRef the norms
+          // that we incRef'ed already and close singleNormsStream and FieldsReader
+          clone.decRef();
         }
       }
-
-      // If we are not cloning, then this will open anew
-      // any norms that have changed:
-      clone.openNorms(si.getUseCompoundFile() ? core.getCFSReader() : directory(), readBufferSize);
-
-      success = true;
+      return clone;
     } finally {
-      if (!success) {
-        // An exception occurred during reopen, we have to decRef the norms
-        // that we incRef'ed already and close singleNormsStream and FieldsReader
-        clone.decRef();
-      }
+      readLock.unlock();
     }
-    
-    return clone;
   }
 
   @Override
@@ -323,49 +372,55 @@ public class SegmentReader extends IndexReader implements Cloneable {
     }
   }
 
-  private synchronized void commitChanges(Map<String,String> commitUserData) throws IOException {
-    if (deletedDocsDirty) {               // re-write deleted
-      si.advanceDelGen();
+  private void commitChanges(Map<String,String> commitUserData) throws IOException {
+    writeLock.lock();
 
-      assert deletedDocs.size() == si.docCount;
+    try {
+      if (deletedDocsDirty) { // re-write deleted
+        si.advanceDelGen();
 
-      // We can write directly to the actual name (vs to a
-      // .tmp & renaming it) because the file is not live
-      // until segments file is written:
-      final String delFileName = si.getDelFileName();
-      boolean success = false;
-      try {
-        deletedDocs.write(directory(), delFileName);
-        success = true;
-      } finally {
-        if (!success) {
-          try {
-            directory().deleteFile(delFileName);
-          } catch (Throwable t) {
-            // suppress this so we keep throwing the
-            // original exception
+        assert deletedDocs.size() == si.docCount;
+
+        // We can write directly to the actual name (vs to a
+        // .tmp & renaming it) because the file is not live
+        // until segments file is written:
+        final String delFileName = si.getDelFileName();
+        boolean success = false;
+        try {
+          deletedDocs.write(directory(), delFileName);
+          success = true;
+        } finally {
+          if (!success) {
+            try {
+              directory().deleteFile(delFileName);
+            } catch (Throwable t) {
+              // suppress this so we keep throwing the
+              // original exception
+            }
+          }
+        }
+
+        si.setDelCount(si.getDelCount() + pendingDeleteCount);
+        pendingDeleteCount = 0;
+        assert deletedDocs.count() == si.getDelCount() : "delete count mismatch during commit: info="
+            + si.getDelCount() + " vs BitVector=" + deletedDocs.count();
+      } else {
+        assert pendingDeleteCount == 0;
+      }
+      if (normsDirty) { // re-write norms
+        si.setNumFields(core.fieldInfos.size());
+        for (final SegmentNorms norm : norms.values()) {
+          if (norm.dirty) {
+            norm.reWrite(si);
           }
         }
       }
-
-      si.setDelCount(si.getDelCount()+pendingDeleteCount);
-      pendingDeleteCount = 0;
-      assert deletedDocs.count() == si.getDelCount(): "delete count mismatch during commit: info=" + si.getDelCount() + " vs BitVector=" + deletedDocs.count();
-    } else {
-      assert pendingDeleteCount == 0;
+      deletedDocsDirty = false;
+      normsDirty = false;
+      hasChanges = false;
+    } finally {
+      writeLock.unlock();
     }
-
-    if (normsDirty) {               // re-write norms
-      si.setNumFields(core.fieldInfos.size());
-      for (final SegmentNorms norm : norms.values()) {
-        if (norm.dirty) {
-          norm.reWrite(si);
-        }
-      }
-    }
-    deletedDocsDirty = false;
-    normsDirty = false;
-    hasChanges = false;
   }
 
   FieldsReader getFieldsReader() {
@@ -478,8 +533,14 @@ public class SegmentReader extends IndexReader implements Cloneable {
   }
 
   @Override
-  public synchronized boolean isDeleted(int n) {
-    return (deletedDocs != null && deletedDocs.get(n));
+  public  boolean isDeleted(int n) {
+    readLock.lock();
+
+    try {
+      return (deletedDocs != null && deletedDocs.get(n));
+    } finally {
+      readLock.unlock();
+    }
   }
 
   @Override
@@ -614,17 +675,23 @@ public class SegmentReader extends IndexReader implements Cloneable {
 
   /** Read norms into a pre-allocated array. */
   @Override
-  public synchronized void norms(String field, byte[] bytes, int offset)
+  public void norms(String field, byte[] bytes, int offset)
     throws IOException {
 
-    ensureOpen();
-    SegmentNorms norm = norms.get(field);
-    if (norm == null) {
-      Arrays.fill(bytes, offset, bytes.length, Similarity.getDefault().encodeNormValue(1.0f));
-      return;
+    readLock.lock();
+
+    try {
+      ensureOpen();
+      SegmentNorms norm = norms.get(field);
+      if (norm == null) {
+        Arrays.fill(bytes, offset, bytes.length, Similarity.getDefault()
+            .encodeNormValue(1.0f));
+        return;
+      }
+      norm.bytes(bytes, offset, maxDoc());
+    } finally {
+      readLock.unlock();
     }
-  
-    norm.bytes(bytes, offset, maxDoc());
   }
 
   // For testing
@@ -933,5 +1000,15 @@ public class SegmentReader extends IndexReader implements Cloneable {
     // SegmentReaders.  We only notify once that core is no
     // longer used (all SegmentReaders sharing it have been
     // closed).
+  }
+
+  public AtomicInteger getDeletedDocsRef() {
+    // access to this was not synchronized before ReadWriteLock
+    return deletedDocsRef;
+  }
+
+  public void setDeletedDocsRef(AtomicInteger deletedDocsRef) {
+    // access to this was not synchronized before ReadWriteLock
+    this.deletedDocsRef = deletedDocsRef;
   }
 }
