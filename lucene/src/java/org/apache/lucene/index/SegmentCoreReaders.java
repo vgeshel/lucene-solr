@@ -19,6 +19,11 @@ package org.apache.lucene.index;
 
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IndexInput;
@@ -49,7 +54,12 @@ final class SegmentCoreReaders {
 
   private final SegmentReader owner;
 
-  TermInfosReader tis;
+  final AtomicReference<TermInfosReader> tis = new AtomicReference<TermInfosReader>(null);
+
+  final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+  final Lock readLock = rwLock.readLock();
+  final Lock writeLock = rwLock.writeLock();
+
   FieldsReader fieldsReaderOrig;
   TermVectorsReader termVectorsReaderOrig;
   CompoundFileReader cfsReader;
@@ -77,7 +87,7 @@ final class SegmentCoreReaders {
       if (termsIndexDivisor == -1) {
         tisNoIndex = reader;
       } else {
-        tis = reader;
+        tis.set(reader);
         tisNoIndex = null;
       }
 
@@ -104,32 +114,50 @@ final class SegmentCoreReaders {
     this.owner = owner;
   }
 
-  synchronized TermVectorsReader getTermVectorsReaderOrig() {
-    return termVectorsReaderOrig;
+  TermVectorsReader getTermVectorsReaderOrig() {
+    readLock.lock();
+
+    try {
+      return termVectorsReaderOrig;
+    } finally {
+      readLock.unlock();
+    }
   }
 
-  synchronized FieldsReader getFieldsReaderOrig() {
-    return fieldsReaderOrig;
+  FieldsReader getFieldsReaderOrig() {
+    readLock.lock();
+
+    try {
+      return fieldsReaderOrig;
+    } finally {
+      readLock.unlock();
+    }
   }
 
-  synchronized void incRef() {
+  void incRef() {
     ref.incrementAndGet();
   }
 
-  synchronized Directory getCFSReader() {
-    return cfsReader;
+  Directory getCFSReader() {
+    readLock.lock();
+
+    try {
+      return cfsReader;
+    } finally {
+      readLock.unlock();
+    }
   }
 
-  synchronized TermInfosReader getTermsReader() {
-    if (tis != null) {
-      return tis;
+  TermInfosReader getTermsReader() {
+    if (tis.get() != null) {
+      return tis.get();
     } else {
       return tisNoIndex;
     }
   }      
 
-  synchronized boolean termsIndexIsLoaded() {
-    return tis != null;
+  boolean termsIndexIsLoaded() {
+    return tis.get() != null;
   }      
 
   // NOTE: only called from IndexWriter when a near
@@ -137,89 +165,105 @@ final class SegmentCoreReaders {
   // sharing a segment that's still being merged.  This
   // method is not fully thread safe, and relies on the
   // synchronization in IndexWriter
-  synchronized void loadTermsIndex(SegmentInfo si, int termsIndexDivisor) throws IOException {
-    if (tis == null) {
-      Directory dir0;
-      if (si.getUseCompoundFile()) {
-        // In some cases, we were originally opened when CFS
-        // was not used, but then we are asked to open the
-        // terms reader with index, the segment has switched
-        // to CFS
-        if (cfsReader == null) {
-          cfsReader = new CompoundFileReader(dir, IndexFileNames.segmentFileName(segment, IndexFileNames.COMPOUND_FILE_EXTENSION), readBufferSize);
+  void loadTermsIndex(SegmentInfo si, int termsIndexDivisor) throws IOException {
+    writeLock.lock();
+
+    try {
+      if (tis.get() == null) {
+        Directory dir0;
+        if (si.getUseCompoundFile()) {
+          // In some cases, we were originally opened when CFS
+          // was not used, but then we are asked to open the
+          // terms reader with index, the segment has switched
+          // to CFS
+          if (cfsReader == null) {
+            cfsReader = new CompoundFileReader(dir, IndexFileNames.segmentFileName(segment, IndexFileNames.COMPOUND_FILE_EXTENSION), readBufferSize);
+          }
+          dir0 = cfsReader;
+        } else {
+          dir0 = dir;
         }
-        dir0 = cfsReader;
-      } else {
-        dir0 = dir;
-      }
 
-      tis = new TermInfosReader(dir0, segment, fieldInfos, readBufferSize, termsIndexDivisor);
+        tis.set(new TermInfosReader(dir0, segment, fieldInfos, readBufferSize, termsIndexDivisor));
+      }
+    } finally {
+      writeLock.unlock();
     }
   }
 
-  synchronized void decRef() throws IOException {
-
+  void decRef() throws IOException {
     if (ref.decrementAndGet() == 0) {
-      IOUtils.close(tis, tisNoIndex, freqStream, proxStream, termVectorsReaderOrig,
-                    fieldsReaderOrig, cfsReader, storeCFSReader);
-      tis = null;
-      // Now, notify any ReaderFinished listeners:
-      if (owner != null) {
-        owner.notifyReaderFinishedListeners();
+      writeLock.lock();
+
+      try {
+        IOUtils.close(tis.get(), tisNoIndex, freqStream, proxStream, termVectorsReaderOrig,
+            fieldsReaderOrig, cfsReader, storeCFSReader);
+        tis.set(null);
+        // Now, notify any ReaderFinished listeners:
+        if (owner != null) {
+          owner.notifyReaderFinishedListeners();
+        }
+      } finally {
+        writeLock.unlock();
       }
     }
   }
 
-  synchronized void openDocStores(SegmentInfo si) throws IOException {
+  void openDocStores(SegmentInfo si) throws IOException {
+    writeLock.lock();
 
-    assert si.name.equals(segment);
+    try {
+      assert si.name.equals(segment);
 
-    if (fieldsReaderOrig == null) {
-      final Directory storeDir;
-      if (si.getDocStoreOffset() != -1) {
-        if (si.getDocStoreIsCompoundFile()) {
-          assert storeCFSReader == null;
-          storeCFSReader = new CompoundFileReader(dir,
-              IndexFileNames.segmentFileName(si.getDocStoreSegment(), IndexFileNames.COMPOUND_FILE_STORE_EXTENSION),
-                                                  readBufferSize);
-          storeDir = storeCFSReader;
+      if (fieldsReaderOrig == null) {
+        final Directory storeDir;
+        if (si.getDocStoreOffset() != -1) {
+          if (si.getDocStoreIsCompoundFile()) {
+            assert storeCFSReader == null;
+            storeCFSReader = new CompoundFileReader(dir,
+                IndexFileNames.segmentFileName(si.getDocStoreSegment(), IndexFileNames.COMPOUND_FILE_STORE_EXTENSION),
+                readBufferSize);
+            storeDir = storeCFSReader;
+            assert storeDir != null;
+          } else {
+            storeDir = dir;
+            assert storeDir != null;
+          }
+        } else if (si.getUseCompoundFile()) {
+          // In some cases, we were originally opened when CFS
+          // was not used, but then we are asked to open doc
+          // stores after the segment has switched to CFS
+          if (cfsReader == null) {
+            cfsReader = new CompoundFileReader(dir, IndexFileNames.segmentFileName(segment, IndexFileNames.COMPOUND_FILE_EXTENSION), readBufferSize);
+          }
+          storeDir = cfsReader;
           assert storeDir != null;
         } else {
           storeDir = dir;
           assert storeDir != null;
         }
-      } else if (si.getUseCompoundFile()) {
-        // In some cases, we were originally opened when CFS
-        // was not used, but then we are asked to open doc
-        // stores after the segment has switched to CFS
-        if (cfsReader == null) {
-          cfsReader = new CompoundFileReader(dir, IndexFileNames.segmentFileName(segment, IndexFileNames.COMPOUND_FILE_EXTENSION), readBufferSize);
+
+        final String storesSegment;
+        if (si.getDocStoreOffset() != -1) {
+          storesSegment = si.getDocStoreSegment();
+        } else {
+          storesSegment = segment;
         }
-        storeDir = cfsReader;
-        assert storeDir != null;
-      } else {
-        storeDir = dir;
-        assert storeDir != null;
-      }
 
-      final String storesSegment;
-      if (si.getDocStoreOffset() != -1) {
-        storesSegment = si.getDocStoreSegment();
-      } else {
-        storesSegment = segment;
-      }
+        fieldsReaderOrig = new FieldsReader(storeDir, storesSegment, fieldInfos, readBufferSize,
+            si.getDocStoreOffset(), si.docCount);
 
-      fieldsReaderOrig = new FieldsReader(storeDir, storesSegment, fieldInfos, readBufferSize,
-                                          si.getDocStoreOffset(), si.docCount);
+        // Verify two sources of "maxDoc" agree:
+        if (si.getDocStoreOffset() == -1 && fieldsReaderOrig.size() != si.docCount) {
+          throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + fieldsReaderOrig.size() + " but segmentInfo shows " + si.docCount);
+        }
 
-      // Verify two sources of "maxDoc" agree:
-      if (si.getDocStoreOffset() == -1 && fieldsReaderOrig.size() != si.docCount) {
-        throw new CorruptIndexException("doc counts differ for segment " + segment + ": fieldsReader shows " + fieldsReaderOrig.size() + " but segmentInfo shows " + si.docCount);
+        if (si.getHasVectors()) { // open term vector files only as needed
+          termVectorsReaderOrig = new TermVectorsReader(storeDir, storesSegment, fieldInfos, readBufferSize, si.getDocStoreOffset(), si.docCount);
+        }
       }
-
-      if (si.getHasVectors()) { // open term vector files only as needed
-        termVectorsReaderOrig = new TermVectorsReader(storeDir, storesSegment, fieldInfos, readBufferSize, si.getDocStoreOffset(), si.docCount);
-      }
+    } finally {
+      writeLock.unlock();
     }
   }
 
