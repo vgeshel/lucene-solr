@@ -66,6 +66,8 @@ public class SnapPuller {
   private final Integer pollInterval;
 
   private String pollIntervalStr;
+  
+  private final boolean randomStagger;
 
   private ScheduledExecutorService executorService;
 
@@ -128,6 +130,15 @@ public class SnapPuller {
     this.replicationHandler = handler;
     pollIntervalStr = (String) initArgs.get(POLL_INTERVAL);
     pollInterval = readInterval(pollIntervalStr);
+    
+    String randomStraggerStr = (String) initArgs.get(RANDOM_STAGGER);
+    
+    if (randomStraggerStr != null) {
+      randomStagger = "true".equalsIgnoreCase(randomStraggerStr);
+    } else {
+      randomStagger = false;
+    }
+    
     String compress = (String) initArgs.get(COMPRESSION);
     useInternal = INTERNAL.equals(compress);
     useExternal = EXTERNAL.equals(compress);
@@ -149,12 +160,26 @@ public class SnapPuller {
 
   private void startExecutorService() {
     Runnable task = new Runnable() {
+      private Random random = new Random();
+      
       public void run() {
         if (pollDisabled.get()) {
           LOG.info("Poll disabled");
           return;
         }
         try {
+          if (randomStagger) {
+            long delay = random.nextInt(pollInterval / 2);
+            
+            LOG.debug("delay before replication for {}ms", delay);
+            
+            try {
+              Thread.sleep(delay);
+            } catch (Exception e) {
+              LOG.warn("stagger sleep interrupted", e);
+            }
+          }
+          
           executorStartTime = System.currentTimeMillis();
           replicationHandler.doFetch(null);
         } catch (Exception e) {
@@ -162,9 +187,10 @@ public class SnapPuller {
         }
       }
     };
+    
     executorService = Executors.newSingleThreadScheduledExecutor();
     long initialDelay = pollInterval - (System.currentTimeMillis() % pollInterval);
-    executorService.scheduleAtFixedRate(task, initialDelay, pollInterval, TimeUnit.MILLISECONDS);
+    executorService.scheduleWithFixedDelay(task, initialDelay, pollInterval, TimeUnit.MILLISECONDS);
     LOG.info("Poll Scheduled at an interval of " + pollInterval + "ms");
   }
 
@@ -1165,6 +1191,8 @@ public class SnapPuller {
   public static final String REPLICATION_PROPERTIES = "replication.properties";
 
   public static final String POLL_INTERVAL = "pollInterval";
+  
+  public static final String RANDOM_STAGGER = "randomStagger";
 
   public static final String INTERVAL_ERR_MSG = "The " + POLL_INTERVAL + " must be in this format 'HH:mm:ss'";
 
