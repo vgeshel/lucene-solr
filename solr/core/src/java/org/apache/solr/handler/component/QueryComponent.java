@@ -56,6 +56,8 @@ import org.apache.solr.search.grouping.endresulttransformer.GroupedEndResultTran
 import org.apache.solr.search.grouping.endresulttransformer.MainEndResultTransformer;
 import org.apache.solr.search.grouping.endresulttransformer.SimpleEndResultTransformer;
 import org.apache.solr.util.SolrPluginUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URL;
@@ -70,6 +72,7 @@ import java.util.*;
 public class QueryComponent extends SearchComponent
 {
   public static final String COMPONENT_NAME = "query";
+  private static final Logger log = LoggerFactory.getLogger(QueryComponent.class);
   
   @Override
   public void prepare(ResponseBuilder rb) throws IOException
@@ -94,6 +97,11 @@ public class QueryComponent extends SearchComponent
 
     if (rb.getQueryString() == null) {
       rb.setQueryString( params.get( CommonParams.Q ) );
+    }
+    
+    if (rb.getQueryString() == null) {
+      log.warn("null query (field '{}') in SolrParams: {}", CommonParams.Q, params.toNamedList());
+      rb.setQueryString("");
     }
 
     try {
