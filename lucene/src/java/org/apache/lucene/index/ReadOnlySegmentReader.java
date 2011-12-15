@@ -33,7 +33,7 @@ class ReadOnlySegmentReader extends SegmentReader {
   // Not synchronized
   @Override
   public boolean isDeleted(int n) {
-    final BitVector deletedDocs = getDeletedDocs();
+    final BitVector deletedDocs = getDeletedDocsUnsafe();
     return deletedDocs != null && deletedDocs.get(n);
   }
 }

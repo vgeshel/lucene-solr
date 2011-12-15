@@ -106,10 +106,14 @@ public class SegmentReader extends IndexReader implements Cloneable {
     readLock.lock();
     
     try {
-      return deletedDocs;
+      return getDeletedDocsUnsafe();
     } finally {
       readLock.unlock();
     }
+  }
+
+  protected final BitVector getDeletedDocsUnsafe() {
+    return deletedDocs;
   }
 
   /**
