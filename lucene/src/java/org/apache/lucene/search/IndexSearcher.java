@@ -233,7 +233,7 @@ public class IndexSearcher extends Searcher {
   @Override
   public int docFreq(final Term term) throws IOException {
     if (executor == null) {
-      return reader.docFreq(term);
+      return ReaderUtil.computeDocFreq(subReaders, term);
     } else {
       final ExecutionHelper<Integer> runner = new ExecutionHelper<Integer>(executor);
       for(int i = 0; i < subReaders.length; i++) {

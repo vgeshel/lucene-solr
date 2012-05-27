@@ -18,10 +18,16 @@ package org.apache.lucene.util;
  */
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveTask;
 
 import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
 
 /**
  * Common util methods for dealing with {@link IndexReader}s.
@@ -29,6 +35,7 @@ import org.apache.lucene.index.IndexReader;
  * @lucene.internal
  */
 public final class ReaderUtil {
+  private static final ForkJoinPool fjPool = new ForkJoinPool();
 
   private ReaderUtil() {} // no instance
 
@@ -50,43 +57,120 @@ public final class ReaderUtil {
     }
   }
 
-  /** Recursively visits all sub-readers of a reader.  You
-   *  should subclass this and override the add method to
-   *  gather what you need.
-   *
-   * @lucene.experimental */
-  public static abstract class Gather {
-    private final IndexReader topReader;
+  public static interface ReaderVisitor<T> {
+    T process(IndexReader r) throws IOException;
 
-    public Gather(IndexReader r) {
-      topReader = r;
+    T add(T t1, T t2);
+
+    T initial();
+  }
+
+  private static class ReaderTask<T> extends RecursiveTask<T> {
+    /**
+     * 
+     */
+    private static final long serialVersionUID = -5820240087339249330L;
+    private ReaderVisitor<T> v;
+    private IndexReader r;
+
+    private ReaderTask(ReaderVisitor<T> visitor, IndexReader r) {
+      this.v = visitor;
+      this.r = r;
     }
 
-    public int run() throws IOException {
-      return run(0, topReader);
-    }
+    @Override
+    protected T compute() {
+      IndexReader[] subs = r.getSequentialSubReaders();
 
-    public int run(int docBase) throws IOException {
-      return run(docBase, topReader);
-    }
-
-    private int run(int base, IndexReader reader) throws IOException {
-      IndexReader[] subReaders = reader.getSequentialSubReaders();
-      if (subReaders == null) {
-        // atomic reader
-        add(base, reader);
-        base += reader.maxDoc();
-      } else {
-        // composite reader
-        for (int i = 0; i < subReaders.length; i++) {
-          base = run(base, subReaders[i]);
+      if (subs == null || subs.length == 0) {
+        try {
+          return v.process(r);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
         }
+      } else {
+        ReaderTask<T>[] tasks = new ReaderTask[subs.length];
+
+        for (int i = 0; i < subs.length; i ++) {
+          tasks[i] = new ReaderTask<T>(v, subs[i]);
+          tasks[i].fork();
+        }
+
+        T ret = v.initial();
+
+        for (int i = 0; i < tasks.length; i ++) {
+          ret = v.add(ret, tasks[i].join());
+        }
+
+        return ret;
+      }
+    }
+
+  }
+
+  public static <T> T visitReader(IndexReader reader, ReaderVisitor<T> v) {
+    return fjPool.invoke(new ReaderTask<T>(v, reader));
+  }
+
+  public static <T> T visitReaders(IndexReader[] readers, ReaderVisitor<T> v) {
+    if (readers.length == 0) {
+      return v.initial();
+    } else if (readers.length == 1) {
+      try {
+        return v.process(readers[0]);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    } else {
+      ReaderTask<T>[] tasks = new ReaderTask[readers.length];
+
+      for (int i = 0; i < readers.length; i ++) {
+        tasks[i] = new ReaderTask<T>(v, readers[i]);
+        fjPool.submit(tasks[i]);
       }
 
-      return base;
+      T ret = v.initial();
+
+      for (int i = 0; i < tasks.length; i ++) {
+        ret = v.add(ret, tasks[i].join());
+      }
+
+      return ret;
+    }
+  }
+
+  private static class DocFreqCollector implements ReaderVisitor<Integer> {
+    private final Term t;
+
+
+    public DocFreqCollector(Term t) {
+      super();
+      this.t = t;
     }
 
-    protected abstract void add(int base, IndexReader r) throws IOException;
+    @Override
+    public Integer process(IndexReader r) throws IOException {
+      return r.docFreq(t);
+    }
+
+    @Override
+    public Integer add(Integer t1, Integer t2) {
+      return t1 + t2;
+    }
+
+    @Override
+    public Integer initial() {
+      return 0;
+    }
+
+  }
+
+  public static int computeDocFreq(IndexReader reader, final Term t) throws IOException {
+    return visitReader(reader, new DocFreqCollector(t));
+  }
+
+  public static int computeDocFreq(IndexReader[] readers, final Term t) throws IOException {
+    return visitReaders(readers, new DocFreqCollector(t));
   }
 
   /**
@@ -109,7 +193,7 @@ public final class ReaderUtil {
     }
     return subReaders[ReaderUtil.subIndex(doc, docStarts)];
   }
-  
+
   /**
    * Returns sub-reader subIndex from reader.
    * 

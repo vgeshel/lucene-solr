@@ -38,6 +38,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.Lock;
 import org.apache.lucene.store.LockObtainFailedException;
 import org.apache.lucene.util.MapBackedSet;
+import org.apache.lucene.util.ReaderUtil;
 
 /** 
  * An IndexReader which reads indexes with multiple segments.
@@ -714,9 +715,7 @@ class DirectoryReader extends IndexReader implements Cloneable {
   @Override
   public int docFreq(Term t) throws IOException {
     ensureOpen();
-    int total = 0;          // sum freqs in segments
-    for (int i = 0; i < subReaders.length; i++)
-      total += subReaders[i].docFreq(t);
+    int total = ReaderUtil.computeDocFreq(subReaders, t);          // sum freqs in segments
     return total;
   }
 

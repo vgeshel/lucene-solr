@@ -26,6 +26,7 @@ import org.apache.lucene.index.TermDocs;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.search.Explanation.IDFExplanation;
 import org.apache.lucene.util.ReaderUtil;
+import org.apache.lucene.util.ReaderUtil.ReaderVisitor;
 import org.apache.lucene.util.ToStringUtils;
 
 /** A Query that matches documents containing a term.
@@ -34,6 +35,11 @@ import org.apache.lucene.util.ToStringUtils;
 public class TermQuery extends Query {
   private Term term;
 
+  private static class StateHolder {
+    Set<Integer> hash = new HashSet<Integer>();
+    int dfSum;
+  }
+  
   private class TermWeight extends Weight {
     private final Similarity similarity;
     private float value;
@@ -47,21 +53,37 @@ public class TermQuery extends Query {
       throws IOException {
       this.similarity = getSimilarity(searcher);
       if (searcher instanceof IndexSearcher) {
-        hash = new HashSet<Integer>();
         IndexReader ir = ((IndexSearcher)searcher).getIndexReader();
-        final int dfSum[] = new int[1];
-        new ReaderUtil.Gather(ir) {
+        StateHolder sh = ReaderUtil.visitReader(ir, new ReaderVisitor<StateHolder>() {
           @Override
-          protected void add(int base, IndexReader r) throws IOException {
-            int df = r.docFreq(term);
-            dfSum[0] += df;
-            if (df > 0) {
-              hash.add(r.hashCode());
-            }
+          public StateHolder process(IndexReader r) throws IOException {
+            StateHolder ret = new StateHolder();
+            
+            ret.dfSum = r.docFreq(term);
+            ret.hash.add(r.hashCode());
+            
+            return ret;
           }
-        }.run();
 
-        idfExp = similarity.idfExplain(term, searcher, dfSum[0]);
+          @Override
+          public StateHolder add(StateHolder t1, StateHolder t2) {
+            StateHolder ret = new StateHolder();
+            
+            ret.dfSum = t1.dfSum + t2.dfSum;
+            ret.hash.addAll(t1.hash);
+            ret.hash.addAll(t2.hash);
+            
+            return ret;
+          }
+
+          @Override
+          public StateHolder initial() {
+            return new StateHolder();
+          }
+        });
+
+        hash = sh.hash;
+        idfExp = similarity.idfExplain(term, searcher, sh.dfSum);
       } else {
         idfExp = similarity.idfExplain(term, searcher);
         hash = null;

@@ -31,6 +31,7 @@ import org.apache.lucene.index.DirectoryReader.MultiTermEnum;
 import org.apache.lucene.index.DirectoryReader.MultiTermPositions;
 import org.apache.lucene.search.Similarity;
 import org.apache.lucene.util.MapBackedSet;
+import org.apache.lucene.util.ReaderUtil;
 
 /** An IndexReader which reads multiple indexes, appending
  * their content. */
@@ -368,9 +369,7 @@ public class MultiReader extends IndexReader implements Cloneable {
   @Override
   public int docFreq(Term t) throws IOException {
     ensureOpen();
-    int total = 0;          // sum freqs in segments
-    for (int i = 0; i < subReaders.length; i++)
-      total += subReaders[i].docFreq(t);
+    int total = ReaderUtil.computeDocFreq(subReaders, t);          // sum freqs in segments
     return total;
   }
 
