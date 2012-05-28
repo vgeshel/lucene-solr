@@ -38,6 +38,10 @@ import org.apache.lucene.util.OpenBitSet;
 import java.io.IOException;
 import java.net.URL;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -73,7 +77,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   private final int queryResultMaxDocsCached;
   private final boolean useFilterForSortedQuery;
   public final boolean enableLazyFieldLoading;
-  
+
   private final boolean cachingEnabled;
   private final SolrCache<Query,DocSet> filterCache;
   private final SolrCache<QueryResultKey,DocList> queryResultCache;
@@ -81,7 +85,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   private final SolrCache<String,Object> fieldValueCache;
 
   private final LuceneQueryOptimizer optimizer;
-  
+
   // map of generic caches - not synchronized since it's read-only after the constructor.
   private final HashMap<String, SolrCache> cacheMap;
   private static final HashMap<String, SolrCache> noGenericCaches=new HashMap<String,SolrCache>(0);
@@ -89,7 +93,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   // list of all caches associated with this searcher.
   private final SolrCache[] cacheList;
   private static final SolrCache[] noCaches = new SolrCache[0];
-  
+
   private final Collection<String> fieldNames;
   private Collection<String> storedHighlightFieldNames;
 
@@ -112,7 +116,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       Directory directory, boolean enableCache) throws IOException {
     this(core, schema,name, core.getIndexReaderFactory().newReader(directory, false), true, enableCache);
   }
-  
+
   /** Creates a searcher searching the index in the provided directory. */
   public SolrIndexSearcher(SolrCore core, IndexSchema schema, String name, Directory directory, boolean readOnly, boolean enableCache) throws IOException {
     this(core, schema,name, core.getIndexReaderFactory().newReader(directory, readOnly), true, enableCache);
@@ -158,7 +162,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     queryResultMaxDocsCached = solrConfig.queryResultMaxDocsCached;
     useFilterForSortedQuery = solrConfig.useFilterForSortedQuery;
     enableLazyFieldLoading = solrConfig.enableLazyFieldLoading;
-    
+
     cachingEnabled=enableCache;
     if (cachingEnabled) {
       ArrayList<SolrCache> clist = new ArrayList<SolrCache>();
@@ -200,6 +204,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
     // do this at the end since an exception in the constructor means we won't close    
     numOpens.incrementAndGet();
+
   }
 
 
@@ -263,7 +268,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public SolrIndexReader getReader() { return reader; }
   /** Direct access to the IndexSchema for use with this searcher */
   public IndexSchema getSchema() { return schema; }
-  
+
   /**
    * Returns a collection of all field names the index reader knows about.
    */
@@ -282,12 +287,12 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
         try {
           SchemaField field = schema.getField(fieldName);
           if (field.stored() &&
-                  ((field.getType() instanceof org.apache.solr.schema.TextField) ||
+              ((field.getType() instanceof org.apache.solr.schema.TextField) ||
                   (field.getType() instanceof org.apache.solr.schema.StrField))) {
             storedHighlightFieldNames.add(fieldName);
           }
         } catch (RuntimeException e) { // getField() throws a SolrException, but it arrives as a RuntimeException
-            log.warn("Field \"" + fieldName + "\" found in index, but not defined in schema.");
+          log.warn("Field \"" + fieldName + "\" found in index, but not defined in schema.");
         }
       }
     }
@@ -299,62 +304,62 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public static void initRegenerators(SolrConfig solrConfig) {
     if (solrConfig.fieldValueCacheConfig != null && solrConfig.fieldValueCacheConfig.getRegenerator() == null) {
       solrConfig.fieldValueCacheConfig.setRegenerator(
-              new CacheRegenerator() {
-                public boolean regenerateItem(SolrIndexSearcher newSearcher, SolrCache newCache, SolrCache oldCache, Object oldKey, Object oldVal) throws IOException {
-                  if (oldVal instanceof UnInvertedField) {
-                    UnInvertedField.getUnInvertedField((String)oldKey, newSearcher);
-                  }
-                  return true;
-                }
+          new CacheRegenerator() {
+            public boolean regenerateItem(SolrIndexSearcher newSearcher, SolrCache newCache, SolrCache oldCache, Object oldKey, Object oldVal) throws IOException {
+              if (oldVal instanceof UnInvertedField) {
+                UnInvertedField.getUnInvertedField((String)oldKey, newSearcher);
               }
-      );
+              return true;
+            }
+          }
+          );
     }
 
     if (solrConfig.filterCacheConfig != null && solrConfig.filterCacheConfig.getRegenerator() == null) {
       solrConfig.filterCacheConfig.setRegenerator(
-              new CacheRegenerator() {
-                public boolean regenerateItem(SolrIndexSearcher newSearcher, SolrCache newCache, SolrCache oldCache, Object oldKey, Object oldVal) throws IOException {
-                  newSearcher.cacheDocSet((Query)oldKey, null, false);
-                  return true;
-                }
-              }
-      );
+          new CacheRegenerator() {
+            public boolean regenerateItem(SolrIndexSearcher newSearcher, SolrCache newCache, SolrCache oldCache, Object oldKey, Object oldVal) throws IOException {
+              newSearcher.cacheDocSet((Query)oldKey, null, false);
+              return true;
+            }
+          }
+          );
     }
 
     if (solrConfig.queryResultCacheConfig != null && solrConfig.queryResultCacheConfig.getRegenerator() == null) {
       final int queryResultWindowSize = solrConfig.queryResultWindowSize;
       solrConfig.queryResultCacheConfig.setRegenerator(
-              new CacheRegenerator() {
-                public boolean regenerateItem(SolrIndexSearcher newSearcher, SolrCache newCache, SolrCache oldCache, Object oldKey, Object oldVal) throws IOException {
-                  QueryResultKey key = (QueryResultKey)oldKey;
-                  int nDocs=1;
-                  // request 1 doc and let caching round up to the next window size...
-                  // unless the window size is <=1, in which case we will pick
-                  // the minimum of the number of documents requested last time and
-                  // a reasonable number such as 40.
-                  // TODO: make more configurable later...
+          new CacheRegenerator() {
+            public boolean regenerateItem(SolrIndexSearcher newSearcher, SolrCache newCache, SolrCache oldCache, Object oldKey, Object oldVal) throws IOException {
+              QueryResultKey key = (QueryResultKey)oldKey;
+              int nDocs=1;
+              // request 1 doc and let caching round up to the next window size...
+              // unless the window size is <=1, in which case we will pick
+              // the minimum of the number of documents requested last time and
+              // a reasonable number such as 40.
+              // TODO: make more configurable later...
 
-                  if (queryResultWindowSize<=1) {
-                    DocList oldList = (DocList)oldVal;
-                    int oldnDocs = oldList.offset() + oldList.size();
-                    // 40 has factors of 2,4,5,10,20
-                    nDocs = Math.min(oldnDocs,40);
-                  }
-
-                  int flags=NO_CHECK_QCACHE | key.nc_flags;
-                  QueryCommand qc = new QueryCommand();
-                  qc.setQuery(key.query)
-                    .setFilterList(key.filters)
-                    .setSort(key.sort)
-                    .setLen(nDocs)
-                    .setSupersetMaxDoc(nDocs)
-                    .setFlags(flags);
-                  QueryResult qr = new QueryResult();
-                  newSearcher.getDocListC(qr,qc);
-                  return true;
-                }
+              if (queryResultWindowSize<=1) {
+                DocList oldList = (DocList)oldVal;
+                int oldnDocs = oldList.offset() + oldList.size();
+                // 40 has factors of 2,4,5,10,20
+                nDocs = Math.min(oldnDocs,40);
               }
-      );
+
+              int flags=NO_CHECK_QCACHE | key.nc_flags;
+              QueryCommand qc = new QueryCommand();
+              qc.setQuery(key.query)
+              .setFilterList(key.filters)
+              .setSort(key.sort)
+              .setLen(nDocs)
+              .setSupersetMaxDoc(nDocs)
+              .setFlags(flags);
+              QueryResult qr = new QueryResult();
+              newSearcher.getDocListC(qr,qc);
+              return true;
+            }
+          }
+          );
     }
   }
 
@@ -363,22 +368,22 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     return qr;
   }
 
-//  public Hits search(Query query, Filter filter, Sort sort) throws IOException {
-//    // todo - when Solr starts accepting filters, need to
-//    // change this conditional check (filter!=null) and create a new filter
-//    // that ANDs them together if it already exists.
-//
-//    if (optimizer==null || filter!=null || !(query instanceof BooleanQuery)
-//    ) {
-//      return super.search(query,filter,sort);
-//    } else {
-//      Query[] newQuery = new Query[1];
-//      Filter[] newFilter = new Filter[1];
-//      optimizer.optimize((BooleanQuery)query, this, 0, newQuery, newFilter);
-//
-//      return super.search(newQuery[0], newFilter[0], sort);
-//    }
-//  }
+  //  public Hits search(Query query, Filter filter, Sort sort) throws IOException {
+  //    // todo - when Solr starts accepting filters, need to
+  //    // change this conditional check (filter!=null) and create a new filter
+  //    // that ANDs them together if it already exists.
+  //
+  //    if (optimizer==null || filter!=null || !(query instanceof BooleanQuery)
+  //    ) {
+  //      return super.search(query,filter,sort);
+  //    } else {
+  //      Query[] newQuery = new Query[1];
+  //      Filter[] newFilter = new Filter[1];
+  //      optimizer.optimize((BooleanQuery)query, this, 0, newQuery, newFilter);
+  //
+  //      return super.search(newQuery[0], newFilter[0], sort);
+  //    }
+  //  }
 
   /**
    * @return the indexDir on which this searcher is opened
@@ -389,7 +394,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   }
 
   /* ********************** Document retrieval *************************/
-   
+
   /* Future optimizations (yonik)
    *
    * If no cache is present:
@@ -439,7 +444,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
    * remainder will be available lazily).
    */
   public Document doc(int i, Set<String> fields) throws IOException {
-    
+
     Document d;
     if (documentCache != null) {
       d = documentCache.get(i);
@@ -450,7 +455,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       d = getIndexReader().document(i);
     } else {
       d = getIndexReader().document(i, 
-             new SetNonLazyFieldSelector(fields));
+          new SetNonLazyFieldSelector(fields));
     }
 
     if (documentCache != null) {
@@ -624,7 +629,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     return answer;
   }
 
-    // only handle positive (non negative) queries
+  // only handle positive (non negative) queries
   /** @lucene.internal */
   public DocSet getPositiveDocSet(Query q, TermDocsState tdState) throws IOException {
     DocSet answer;
@@ -866,45 +871,45 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   // query must be positive
   protected DocSet getDocSetNC(Query query, DocSet filter, TermDocsState tdState) throws IOException {
     int smallSetSize = maxDoc()>>6;
-    int largestPossible = tdState.tenum.docFreq();
-    int[] docs = new int[Math.min(smallSetSize, largestPossible)];
-    OpenBitSet obs = null;
-    int upto=0;
-    int numBits = 0;
+            int largestPossible = tdState.tenum.docFreq();
+            int[] docs = new int[Math.min(smallSetSize, largestPossible)];
+            OpenBitSet obs = null;
+            int upto=0;
+            int numBits = 0;
 
-    if (tdState.tdocs == null) {
-      tdState.tdocs = reader.termDocs();
-    }
+            if (tdState.tdocs == null) {
+              tdState.tdocs = reader.termDocs();
+            }
 
-    tdState.tdocs.seek(tdState.tenum);
+            tdState.tdocs.seek(tdState.tenum);
 
-    int[] arr = new int[Math.min(largestPossible, 256)];
-    int[] freq = new int[arr.length];
+            int[] arr = new int[Math.min(largestPossible, 256)];
+            int[] freq = new int[arr.length];
 
-    for(;;) {
-      int num = tdState.tdocs.read(arr, freq);
-      if (num==0) break;
-      if (upto + num > docs.length) {
-        if (obs == null) obs = new OpenBitSet(maxDoc());
-        for (int i = 0; i<num; i++) {
-          obs.fastSet(arr[i]);
-        }
-        numBits += num;
-      } else {
-        System.arraycopy(arr, 0, docs, upto, num);
-        upto += num;
-      }
-    }
+            for(;;) {
+              int num = tdState.tdocs.read(arr, freq);
+              if (num==0) break;
+              if (upto + num > docs.length) {
+                if (obs == null) obs = new OpenBitSet(maxDoc());
+                for (int i = 0; i<num; i++) {
+                  obs.fastSet(arr[i]);
+                }
+                numBits += num;
+              } else {
+                System.arraycopy(arr, 0, docs, upto, num);
+                upto += num;
+              }
+            }
 
-    if (obs != null) {
-      for (int i=0; i<upto; i++) {
-        obs.fastSet(docs[i]);
-      }
-      numBits += upto;
-      return new BitDocSet(obs, numBits);
-    }
+            if (obs != null) {
+              for (int i=0; i<upto; i++) {
+                obs.fastSet(docs[i]);
+              }
+              numBits += upto;
+              return new BitDocSet(obs, numBits);
+            }
 
-    return new SortedIntDocSet(docs, upto);
+            return new SortedIntDocSet(docs, upto);
   }
 
 
@@ -952,9 +957,9 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
 
   /**
-  * Converts a filter into a DocSet.
-  * This method is not cache-aware and no caches are checked.
-  */
+   * Converts a filter into a DocSet.
+   * This method is not cache-aware and no caches are checked.
+   */
   public DocSet convertFilter(Filter lfilter) throws IOException {
     DocIdSet docSet = lfilter.getDocIdSet(this.reader);
     OpenBitSet obs = new OpenBitSet();
@@ -986,10 +991,10 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocList getDocList(Query query, Query filter, Sort lsort, int offset, int len) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilterList(filter)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len);
+    .setFilterList(filter)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocList();
@@ -1016,11 +1021,11 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocList getDocList(Query query, List<Query> filterList, Sort lsort, int offset, int len, int flags) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilterList(filterList)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len)
-      .setFlags(flags);
+    .setFilterList(filterList)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len)
+    .setFlags(flags);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocList();
@@ -1065,37 +1070,37 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     if (queryResultCache != null && cmd.getFilter()==null
         && (flags & (NO_CHECK_QCACHE|NO_SET_QCACHE)) != ((NO_CHECK_QCACHE|NO_SET_QCACHE)))
     {
-        // all of the current flags can be reused during warming,
-        // so set all of them on the cache key.
-        key = new QueryResultKey(q, cmd.getFilterList(), cmd.getSort(), flags);
-        if ((flags & NO_CHECK_QCACHE)==0) {
-          superset = queryResultCache.get(key);
+      // all of the current flags can be reused during warming,
+      // so set all of them on the cache key.
+      key = new QueryResultKey(q, cmd.getFilterList(), cmd.getSort(), flags);
+      if ((flags & NO_CHECK_QCACHE)==0) {
+        superset = queryResultCache.get(key);
 
-          if (superset != null) {
-            // check that the cache entry has scores recorded if we need them
-            if ((flags & GET_SCORES)==0 || superset.hasScores()) {
-              // NOTE: subset() returns null if the DocList has fewer docs than
-              // requested
-              out.docList = superset.subset(cmd.getOffset(),cmd.getLen());
-            }
-          }
-          if (out.docList != null) {
-            // found the docList in the cache... now check if we need the docset too.
-            // OPT: possible future optimization - if the doclist contains all the matches,
-            // use it to make the docset instead of rerunning the query.
-            if (out.docSet==null && ((flags & GET_DOCSET)!=0) ) {
-              if (cmd.getFilterList()==null) {
-                out.docSet = getDocSet(cmd.getQuery());
-              } else {
-                List<Query> newList = new ArrayList<Query>(cmd.getFilterList().size()+1);
-                newList.add(cmd.getQuery());
-                newList.addAll(cmd.getFilterList());
-                out.docSet = getDocSet(newList);
-              }
-            }
-            return;
+        if (superset != null) {
+          // check that the cache entry has scores recorded if we need them
+          if ((flags & GET_SCORES)==0 || superset.hasScores()) {
+            // NOTE: subset() returns null if the DocList has fewer docs than
+            // requested
+            out.docList = superset.subset(cmd.getOffset(),cmd.getLen());
           }
         }
+        if (out.docList != null) {
+          // found the docList in the cache... now check if we need the docset too.
+          // OPT: possible future optimization - if the doclist contains all the matches,
+          // use it to make the docset instead of rerunning the query.
+          if (out.docSet==null && ((flags & GET_DOCSET)!=0) ) {
+            if (cmd.getFilterList()==null) {
+              out.docSet = getDocSet(cmd.getQuery());
+            } else {
+              List<Query> newList = new ArrayList<Query>(cmd.getFilterList().size()+1);
+              newList.add(cmd.getQuery());
+              newList.addAll(cmd.getFilterList());
+              out.docSet = getDocSet(newList);
+            }
+          }
+          return;
+        }
+      }
 
       // If we are going to generate the result, bump up to the
       // next resultWindowSize for better caching.
@@ -1174,84 +1179,122 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     }
   }
 
+  private static class AtomicFloat {
+    private AtomicInteger i;
 
+    public AtomicFloat(float f) {
+      i = new AtomicInteger(Float.floatToIntBits(f));
+    }
 
-  private void getDocListNC(QueryResult qr,QueryCommand cmd) throws IOException {
+    public void setIfGreater(final float f) {
+      boolean done  = false;
+      final int newI = Float.floatToIntBits(f);
+
+      while (! done) {
+        final int currentI = i.get();
+        final float currentF = Float.intBitsToFloat(currentI);
+
+        if (f > currentF) {
+          done = i.compareAndSet(currentI, newI);
+        } else {
+          done = true;
+        }
+      }
+    }
+
+    public float get() {
+      return Float.intBitsToFloat(i.get());
+    }
+  }
+
+  private void getDocListNC(QueryResult qr,final QueryCommand cmd) throws IOException {
     final long timeAllowed = cmd.getTimeAllowed();
-    int len = cmd.getSupersetMaxDoc();
+    final int len = cmd.getSupersetMaxDoc();
     int last = len;
     if (last < 0 || last > maxDoc()) last=maxDoc();
     final int lastDocRequested = last;
-    int nDocsReturned;
-    int totalHits;
-    float maxScore;
+    int nDocsReturned = 0;
+    int totalHits = 0;
+    float maxScore = 0;
     int[] ids;
     float[] scores;
 
-    boolean needScores = (cmd.getFlags() & GET_SCORES) != 0;
+    final boolean needScores = (cmd.getFlags() & GET_SCORES) != 0;
 
     Query query = QueryUtils.makeQueryable(cmd.getQuery());
 
-    ProcessedFilter pf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
+    final ProcessedFilter pf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
     final Filter luceneFilter = pf.filter;
+
+    // must create normalized weight using the top-level searcher
+    Weight weight = createNormalizedWeight(query);
 
     // handle zero case...
     if (lastDocRequested<=0) {
-      final float[] topscore = new float[] { Float.NEGATIVE_INFINITY };
-      final int[] numHits = new int[1];
+      // TODO convert this branch to fjPool too
+      final AtomicFloat topscore = new AtomicFloat(Float.NEGATIVE_INFINITY);
+      final AtomicInteger numHits = new AtomicInteger(0);
 
-      Collector collector;
+      final Callable<Collector> collectorFactory = new Callable<Collector>() {
+        
+        @Override
+        public Collector call() throws Exception {
+          Collector collector;
 
-      if (!needScores) {
-        collector = new Collector () {
-          @Override
-          public void setScorer(Scorer scorer) throws IOException {
+          if (!needScores) {
+            collector = new Collector () {
+              @Override
+              public void setScorer(Scorer scorer) throws IOException {
+              }
+              @Override
+              public void collect(int doc) throws IOException {
+                numHits.incrementAndGet();
+              }
+              @Override
+              public void setNextReader(IndexReader reader, int docBase) throws IOException {
+              }
+              @Override
+              public boolean acceptsDocsOutOfOrder() {
+                return true;
+              }
+            };
+          } else {
+            collector = new Collector() {
+              Scorer scorer;
+              @Override
+              public void setScorer(Scorer scorer) throws IOException {
+                this.scorer = scorer;
+              }
+              @Override
+              public void collect(int doc) throws IOException {
+                numHits.incrementAndGet();
+                float score = scorer.score();
+                topscore.setIfGreater(score);            
+              }
+              @Override
+              public void setNextReader(IndexReader reader, int docBase) throws IOException {
+              }
+              @Override
+              public boolean acceptsDocsOutOfOrder() {
+                return true;
+              }
+            };
           }
-          @Override
-          public void collect(int doc) throws IOException {
-            numHits[0]++;
+
+          if( timeAllowed > 0 ) {
+            collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
           }
-          @Override
-          public void setNextReader(IndexReader reader, int docBase) throws IOException {
+          if (pf.postFilter != null) {
+            pf.postFilter.setLastDelegate(collector);
+            collector = pf.postFilter;
           }
-          @Override
-          public boolean acceptsDocsOutOfOrder() {
-            return true;
-          }
-        };
-      } else {
-        collector = new Collector() {
-          Scorer scorer;
-          @Override
-          public void setScorer(Scorer scorer) throws IOException {
-            this.scorer = scorer;
-          }
-          @Override
-          public void collect(int doc) throws IOException {
-            numHits[0]++;
-            float score = scorer.score();
-            if (score > topscore[0]) topscore[0]=score;            
-          }
-          @Override
-          public void setNextReader(IndexReader reader, int docBase) throws IOException {
-          }
-          @Override
-          public boolean acceptsDocsOutOfOrder() {
-            return true;
-          }
-        };
-      }
+
+          return collector;
+        }
+      };
       
-      if( timeAllowed > 0 ) {
-        collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
-      }
-      if (pf.postFilter != null) {
-        pf.postFilter.setLastDelegate(collector);
-        collector = pf.postFilter;
-      }
-
       try {
-        super.search(query, luceneFilter, collector);
+        super.searchParallel(weight, luceneFilter, collectorFactory);
       }
       catch( TimeLimitingCollector.TimeExceededException x ) {
         log.warn( "Query: " + query + "; " + x.getMessage() );
@@ -1261,34 +1304,62 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       nDocsReturned=0;
       ids = new int[nDocsReturned];
       scores = new float[nDocsReturned];
-      totalHits = numHits[0];
-      maxScore = totalHits>0 ? topscore[0] : 0.0f;
+      totalHits = numHits.get();
+      maxScore = totalHits>0 ? topscore.get() : 0.0f;
     } else {
-      TopDocsCollector topCollector;
-      if (cmd.getSort() == null) {
-        topCollector = TopScoreDocCollector.create(len, true);
-      } else {
-        topCollector = TopFieldCollector.create(weightSort(cmd.getSort()), len, false, needScores, needScores, true);
-      }
-      Collector collector = topCollector;
-      if( timeAllowed > 0 ) {
-        collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
-      }
-      if (pf.postFilter != null) {
-        pf.postFilter.setLastDelegate(collector);
-        collector = pf.postFilter;
-      }
+      final ConcurrentLinkedQueue<TopDocsCollector> tdCollectors = new ConcurrentLinkedQueue<TopDocsCollector>();
+
+      Callable<Collector> collectorFactory = new Callable<Collector>() {
+
+        @Override
+        public Collector call() throws Exception {
+          TopDocsCollector topCollector;
+          if (cmd.getSort() == null) {
+            topCollector = TopScoreDocCollector.create(len, true);
+          } else {
+            topCollector = TopFieldCollector.create(weightSort(cmd.getSort()), len, false, needScores, needScores, true);
+          }
+          Collector collector = topCollector;
+          if( timeAllowed > 0 ) {
+            collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
+          }
+          if (pf.postFilter != null) {
+            pf.postFilter.setLastDelegate(collector);
+            collector = pf.postFilter;
+          }
+
+          tdCollectors.add(topCollector);
+          return collector;
+        }
+      };
+
       try {
-        super.search(query, luceneFilter, collector);
+        // use a subsearcher here instead of super
+        super.searchParallel(weight, luceneFilter, collectorFactory);
       }
       catch( TimeLimitingCollector.TimeExceededException x ) {
         log.warn( "Query: " + query + "; " + x.getMessage() );
         qr.setPartialResults(true);
       }
 
-      totalHits = topCollector.getTotalHits();
-      TopDocs topDocs = topCollector.topDocs(0, len);
-      maxScore = totalHits>0 ? topDocs.getMaxScore() : 0.0f;
+      // invokeAll tasks and wait for up to timeAllowed
+
+      // aggregate results. use TopDocs.merge
+      TopDocs[] topDocsArr = new TopDocs[tdCollectors.size()];
+
+      for (int i = 0; ! tdCollectors.isEmpty(); i ++) {
+        TopDocsCollector topCollector = tdCollectors.remove();
+        totalHits += topCollector.getTotalHits();
+        TopDocs topDocs = topCollector.topDocs(0, len);
+        topDocsArr[i] = topDocs;
+
+        if (topCollector.getTotalHits() > 0) {
+          maxScore = Math.max(maxScore, topDocs.getMaxScore());
+        }
+      }
+
+      TopDocs topDocs = TopDocs.merge(cmd.getSort(), len, topDocsArr);
+
       nDocsReturned = topDocs.scoreDocs.length;
 
       ids = new int[nDocsReturned];
@@ -1337,45 +1408,45 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       Collector collector;
       DocSetCollector setCollector;
 
-       if (!needScores) {
-         collector = setCollector = new DocSetCollector(smallSetSize, maxDoc);
-       } else {
-         collector = setCollector = new DocSetDelegateCollector(smallSetSize, maxDoc, new Collector() {
-           Scorer scorer;
-           @Override
+      if (!needScores) {
+        collector = setCollector = new DocSetCollector(smallSetSize, maxDoc);
+      } else {
+        collector = setCollector = new DocSetDelegateCollector(smallSetSize, maxDoc, new Collector() {
+          Scorer scorer;
+          @Override
           public void setScorer(Scorer scorer) throws IOException {
-             this.scorer = scorer;
-           }
-           @Override
+            this.scorer = scorer;
+          }
+          @Override
           public void collect(int doc) throws IOException {
-             float score = scorer.score();
-             if (score > topscore[0]) topscore[0]=score;
-           }
-           @Override
+            float score = scorer.score();
+            if (score > topscore[0]) topscore[0]=score;
+          }
+          @Override
           public void setNextReader(IndexReader reader, int docBase) throws IOException {
-           }
-           @Override
+          }
+          @Override
           public boolean acceptsDocsOutOfOrder() {
-             return false;
-           }
-         });
-       }
+            return false;
+          }
+        });
+      }
 
-       if( timeAllowed > 0 ) {
-         collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
-       }
+      if( timeAllowed > 0 ) {
+        collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
+      }
       if (pf.postFilter != null) {
         pf.postFilter.setLastDelegate(collector);
         collector = pf.postFilter;
       }
 
-       try {
-         super.search(query, luceneFilter, collector);
-       }
-       catch( TimeLimitingCollector.TimeExceededException x ) {
-         log.warn( "Query: " + query + "; " + x.getMessage() );
-         qr.setPartialResults(true);
-       }
+      try {
+        super.search(query, luceneFilter, collector);
+      }
+      catch( TimeLimitingCollector.TimeExceededException x ) {
+        log.warn( "Query: " + query + "; " + x.getMessage() );
+        qr.setPartialResults(true);
+      }
 
       set = setCollector.getDocSet();
 
@@ -1460,10 +1531,10 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocList getDocList(Query query, DocSet filter, Sort lsort, int offset, int len) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilter(filter)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len);
+    .setFilter(filter)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocList();
@@ -1492,11 +1563,11 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocListAndSet getDocListAndSet(Query query, Query filter, Sort lsort, int offset, int len) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilterList(filter)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len)
-      .setNeedDocSet(true);
+    .setFilterList(filter)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len)
+    .setNeedDocSet(true);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocListAndSet();
@@ -1526,17 +1597,17 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocListAndSet getDocListAndSet(Query query, Query filter, Sort lsort, int offset, int len, int flags) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilterList(filter)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len)
-      .setFlags(flags)
-      .setNeedDocSet(true);
+    .setFilterList(filter)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len)
+    .setFlags(flags)
+    .setNeedDocSet(true);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocListAndSet();
   }
-  
+
 
   /**
    * Returns documents matching both <code>query</code> and the intersection 
@@ -1563,11 +1634,11 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocListAndSet getDocListAndSet(Query query, List<Query> filterList, Sort lsort, int offset, int len) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilterList(filterList)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len)
-      .setNeedDocSet(true);
+    .setFilterList(filterList)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len)
+    .setNeedDocSet(true);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocListAndSet();
@@ -1599,12 +1670,12 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocListAndSet getDocListAndSet(Query query, List<Query> filterList, Sort lsort, int offset, int len, int flags) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilterList(filterList)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len)
-      .setFlags(flags)
-      .setNeedDocSet(true);
+    .setFilterList(filterList)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len)
+    .setFlags(flags)
+    .setNeedDocSet(true);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocListAndSet();
@@ -1628,11 +1699,11 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocListAndSet getDocListAndSet(Query query, DocSet filter, Sort lsort, int offset, int len) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilter(filter)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len)
-      .setNeedDocSet(true);
+    .setFilter(filter)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len)
+    .setNeedDocSet(true);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocListAndSet();
@@ -1662,12 +1733,12 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   public DocListAndSet getDocListAndSet(Query query, DocSet filter, Sort lsort, int offset, int len, int flags) throws IOException {
     QueryCommand qc = new QueryCommand();
     qc.setQuery(query)
-      .setFilter(filter)
-      .setSort(lsort)
-      .setOffset(offset)
-      .setLen(len)
-      .setFlags(flags)
-      .setNeedDocSet(true);
+    .setFilter(filter)
+    .setSort(lsort)
+    .setOffset(offset)
+    .setLen(len)
+    .setFlags(flags)
+    .setNeedDocSet(true);
     QueryResult qr = new QueryResult();
     search(qr,qc);
     return qr.getDocListAndSet();
@@ -1730,7 +1801,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     return a==absQ ? b.intersectionSize(positiveA) : b.andNotSize(positiveA);
   }
 
-   /**
+  /**
    * Returns the number of documents that match both <code>a</code> and <code>b</code>.
    * <p>
    * This method is cache-aware and may check as well as modify the cache.
@@ -1768,9 +1839,9 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
    * of Documents containing all of the stored fields.
    */
   public Document[] readDocs(DocList ids) throws IOException {
-     Document[] docs = new Document[ids.size()];
-     readDocs(docs,ids);
-     return docs;
+    Document[] docs = new Document[ids.size()];
+    readDocs(docs,ids);
+    return docs;
   }
 
 
@@ -1890,7 +1961,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       this.query = query;
       return this;
     }
-    
+
     public List<Query> getFilterList() { return filterList; }
     /**
      * @throws IllegalArgumentException if filter is not null.
@@ -1917,7 +1988,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       }
       return this;
     }
-    
+
     public DocSet getFilter() { return filter; }
     /**
      * @throws IllegalArgumentException if filterList is not null.
@@ -1935,19 +2006,19 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       this.sort = sort;
       return this;
     }
-    
+
     public int getOffset() { return offset; }
     public QueryCommand setOffset(int offset) {
       this.offset = offset;
       return this;
     }
-    
+
     public int getLen() { return len; }
     public QueryCommand setLen(int len) {
       this.len = len;
       return this;
     }
-    
+
     public int getSupersetMaxDoc() { return supersetMaxDoc; }
     public QueryCommand setSupersetMaxDoc(int supersetMaxDoc) {
       this.supersetMaxDoc = supersetMaxDoc;
@@ -1978,7 +2049,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       this.timeAllowed = timeAllowed;
       return this;
     }
-    
+
     public boolean isNeedDocSet() { return (flags & GET_DOCSET) != 0; }
     public QueryCommand setNeedDocSet(boolean needDocSet) {
       return needDocSet ? setFlags(GET_DOCSET) : clearFlags(GET_DOCSET);
@@ -1992,7 +2063,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     private boolean partialResults;
     private DocListAndSet docListAndSet;
     public Object groupedResults; // Todo: Refactor. At least getter setter and different type.
-    
+
     public DocList getDocList() { return docListAndSet.docList; }
     public void setDocList(DocList list) {
       if( docListAndSet == null ) {

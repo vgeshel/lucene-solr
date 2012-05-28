@@ -22,9 +22,13 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
 import java.util.concurrent.RecursiveTask;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.Term;
@@ -57,91 +61,84 @@ public final class ReaderUtil {
     }
   }
 
-  public static interface ReaderVisitor<T> {
-    T process(IndexReader r) throws IOException;
-
-    T add(T t1, T t2);
-
-    T initial();
+  public static interface ReaderVisitor {
+    void visit(IndexReader r);
   }
 
-  private static class ReaderTask<T> extends RecursiveTask<T> {
+  private static class ReaderAction extends RecursiveAction {
     /**
      * 
      */
     private static final long serialVersionUID = -5820240087339249330L;
-    private ReaderVisitor<T> v;
+    private ReaderVisitor v;
     private IndexReader r;
 
-    private ReaderTask(ReaderVisitor<T> visitor, IndexReader r) {
+    private ReaderAction(ReaderVisitor visitor, IndexReader r) {
       this.v = visitor;
       this.r = r;
     }
 
     @Override
-    protected T compute() {
+    protected void compute() {
       IndexReader[] subs = r.getSequentialSubReaders();
 
       if (subs == null || subs.length == 0) {
-        try {
-          return v.process(r);
-        } catch (IOException e) {
-          throw new RuntimeException(e);
-        }
+        v.visit(r);
       } else {
-        ReaderTask<T>[] tasks = new ReaderTask[subs.length];
+        List<ReaderAction> tasks = new ArrayList<ReaderAction>(subs.length);
 
         for (int i = 0; i < subs.length; i ++) {
-          tasks[i] = new ReaderTask<T>(v, subs[i]);
-          tasks[i].fork();
+          tasks.add(new ReaderAction(v, subs[i]));
         }
 
-        T ret = v.initial();
-
-        for (int i = 0; i < tasks.length; i ++) {
-          ret = v.add(ret, tasks[i].join());
-        }
-
-        return ret;
+        invokeAll(tasks);
       }
     }
 
   }
 
-  public static <T> T visitReader(IndexReader reader, ReaderVisitor<T> v) {
-    return fjPool.invoke(new ReaderTask<T>(v, reader));
+  public static void visitReader(IndexReader reader, ReaderVisitor v) {
+    visitReaders(Collections.singletonList(reader), v);
   }
 
-  public static <T> T visitReaders(IndexReader[] readers, ReaderVisitor<T> v) {
-    if (readers.length == 0) {
-      return v.initial();
-    } else if (readers.length == 1) {
-      try {
-        return v.process(readers[0]);
-      } catch (IOException e) {
-        throw new RuntimeException(e);
-      }
+  public static void visitReaders(IndexReader[] readers, ReaderVisitor v) {
+    List<IndexReader> l = new ArrayList<IndexReader>(readers.length);
+    Collections.addAll(l, readers);
+    visitReaders(l, v);
+  }
+
+  @SuppressWarnings("serial")
+  public static void visitReaders(Collection<IndexReader> readers, ReaderVisitor v) {
+    if (readers.size() == 0) {
+      return;
+    } else if (readers.size() == 1) {
+      v.visit(readers.iterator().next());
     } else {
-      ReaderTask<T>[] tasks = new ReaderTask[readers.length];
+      final List<IndexReader> subs = new ArrayList<IndexReader>(readers.size() * 2);
 
-      for (int i = 0; i < readers.length; i ++) {
-        tasks[i] = new ReaderTask<T>(v, readers[i]);
-        fjPool.submit(tasks[i]);
+      for (IndexReader r: readers) {
+        gatherSubReaders(subs, r);
       }
 
-      T ret = v.initial();
+      final List<ReaderAction> tasks = new ArrayList<ReaderAction>(subs.size());
 
-      for (int i = 0; i < tasks.length; i ++) {
-        ret = v.add(ret, tasks[i].join());
+      for (IndexReader r: subs) {
+        tasks.add(new ReaderAction(v, r));
       }
 
-      return ret;
+      fjPool.invoke(new RecursiveAction() {
+
+        @Override
+        protected void compute() {
+          invokeAll(tasks);
+        }
+      });
     }
   }
 
-  private static class DocFreqCollector implements ReaderVisitor<Integer> {
+  private static class DocFreqCollector implements ReaderVisitor {
     private final Term t;
-
+    private final AtomicInteger sum = new AtomicInteger(0); 
 
     public DocFreqCollector(Term t) {
       super();
@@ -149,28 +146,30 @@ public final class ReaderUtil {
     }
 
     @Override
-    public Integer process(IndexReader r) throws IOException {
-      return r.docFreq(t);
+    public void visit(IndexReader r) {
+      try {
+        sum.addAndGet(r.docFreq(t));
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
     }
 
-    @Override
-    public Integer add(Integer t1, Integer t2) {
-      return t1 + t2;
-    }
-
-    @Override
-    public Integer initial() {
-      return 0;
+    public int docFreq() {
+      return sum.get();
     }
 
   }
 
   public static int computeDocFreq(IndexReader reader, final Term t) throws IOException {
-    return visitReader(reader, new DocFreqCollector(t));
+    DocFreqCollector c = new DocFreqCollector(t);
+    visitReader(reader, c);
+    return c.docFreq();
   }
 
   public static int computeDocFreq(IndexReader[] readers, final Term t) throws IOException {
-    return visitReaders(readers, new DocFreqCollector(t));
+    DocFreqCollector c = new DocFreqCollector(t);
+    visitReaders(readers, c);
+    return c.docFreq();
   }
 
   /**

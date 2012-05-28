@@ -20,6 +20,8 @@ package org.apache.lucene.search;
 import java.io.IOException;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.TermDocs;
@@ -54,36 +56,24 @@ public class TermQuery extends Query {
       this.similarity = getSimilarity(searcher);
       if (searcher instanceof IndexSearcher) {
         IndexReader ir = ((IndexSearcher)searcher).getIndexReader();
-        StateHolder sh = ReaderUtil.visitReader(ir, new ReaderVisitor<StateHolder>() {
-          @Override
-          public StateHolder process(IndexReader r) throws IOException {
-            StateHolder ret = new StateHolder();
-            
-            ret.dfSum = r.docFreq(term);
-            ret.hash.add(r.hashCode());
-            
-            return ret;
-          }
+        final AtomicInteger dfSum = new AtomicInteger(0);
+        hash = new ConcurrentSkipListSet<Integer>();
+        
+        ReaderUtil.visitReader(ir, new ReaderVisitor() {
+
 
           @Override
-          public StateHolder add(StateHolder t1, StateHolder t2) {
-            StateHolder ret = new StateHolder();
-            
-            ret.dfSum = t1.dfSum + t2.dfSum;
-            ret.hash.addAll(t1.hash);
-            ret.hash.addAll(t2.hash);
-            
-            return ret;
-          }
-
-          @Override
-          public StateHolder initial() {
-            return new StateHolder();
+          public void visit(IndexReader r) {
+            try {
+              dfSum.addAndGet(r.docFreq(term));
+            } catch (IOException e) {
+              throw new RuntimeException(e);
+            }
+            hash.add(r.hashCode());
           }
         });
 
-        hash = sh.hash;
-        idfExp = similarity.idfExplain(term, searcher, sh.dfSum);
+        idfExp = similarity.idfExplain(term, searcher, dfSum.get());
       } else {
         idfExp = similarity.idfExplain(term, searcher);
         hash = null;

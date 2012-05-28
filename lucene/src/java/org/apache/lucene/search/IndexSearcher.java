@@ -19,15 +19,21 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionService;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.Future;
+import java.util.concurrent.RecursiveAction;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -39,6 +45,7 @@ import org.apache.lucene.index.Term;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.NIOFSDirectory; // javadocs
 import org.apache.lucene.util.ReaderUtil;
+import org.apache.lucene.util.ReaderUtil.ReaderVisitor;
 import org.apache.lucene.util.ThreadInterruptedException;
 
 /** Implements search over a single IndexReader.
@@ -69,12 +76,12 @@ import org.apache.lucene.util.ThreadInterruptedException;
 public class IndexSearcher extends Searcher {
   IndexReader reader;
   private boolean closeReader;
-  
+
   // NOTE: these members might change in incompatible ways
   // in the next release
   protected final IndexReader[] subReaders;
   protected final int[] docStarts;
-  
+
   // These are only used for multi-threaded search
   private final ExecutorService executor;
   protected final IndexSearcher[] subSearchers;
@@ -137,7 +144,7 @@ public class IndexSearcher extends Searcher {
   public IndexSearcher(IndexReader reader, IndexReader[] subReaders, int[] docStarts) {
     this(reader, subReaders, docStarts, null);
   }
-  
+
   // Used only when we are an atomic sub-searcher in a parent
   // IndexSearcher that has an ExecutorService, to record
   // our docBase in the parent IndexSearcher:
@@ -239,10 +246,10 @@ public class IndexSearcher extends Searcher {
       for(int i = 0; i < subReaders.length; i++) {
         final IndexSearcher searchable = subSearchers[i];
         runner.submit(new Callable<Integer>() {
-            public Integer call() throws IOException {
-              return Integer.valueOf(searchable.docFreq(term));
-            }
-          });
+          public Integer call() throws IOException {
+            return Integer.valueOf(searchable.docFreq(term));
+          }
+        });
       }
       int docFreq = 0;
       for (Integer num : runner) {
@@ -257,13 +264,13 @@ public class IndexSearcher extends Searcher {
   public Document doc(int docID) throws CorruptIndexException, IOException {
     return reader.document(docID);
   }
-  
+
   /* Sugar for .getIndexReader().document(docID, fieldSelector) */
   @Override
   public Document doc(int docID, FieldSelector fieldSelector) throws CorruptIndexException, IOException {
     return reader.document(docID, fieldSelector);
   }
-  
+
   /** Expert: Set the Similarity implementation used by this Searcher.
    *
    * @see Similarity#setDefault(Similarity)
@@ -304,7 +311,7 @@ public class IndexSearcher extends Searcher {
   public TopDocs searchAfter(ScoreDoc after, Query query, int n) throws IOException {
     return searchAfter(after, query, null, n);
   }
-  
+
   /** Finds the top <code>n</code>
    * hits for <code>query</code>, applying <code>filter</code> if non-null,
    * where all results are after a previous result (<code>after</code>).
@@ -318,7 +325,7 @@ public class IndexSearcher extends Searcher {
   public TopDocs searchAfter(ScoreDoc after, Query query, Filter filter, int n) throws IOException {
     return search(createNormalizedWeight(query), filter, after, n);
   }
-  
+
   /** Finds the top <code>n</code>
    * hits for <code>query</code>.
    *
@@ -326,7 +333,7 @@ public class IndexSearcher extends Searcher {
    */
   @Override
   public TopDocs search(Query query, int n)
-    throws IOException {
+      throws IOException {
     return search(query, null, n);
   }
 
@@ -338,7 +345,7 @@ public class IndexSearcher extends Searcher {
    */
   @Override
   public TopDocs search(Query query, Filter filter, int n)
-    throws IOException {
+      throws IOException {
     return search(createNormalizedWeight(query), filter, n);
   }
 
@@ -360,29 +367,29 @@ public class IndexSearcher extends Searcher {
    */
   @Override
   public void search(Query query, Filter filter, Collector results)
-    throws IOException {
+      throws IOException {
     search(createNormalizedWeight(query), filter, results);
   }
 
   /** Lower-level search API.
-  *
-  * <p>{@link Collector#collect(int)} is called for every matching document.
-  *
-  * <p>Applications should only use this if they need <i>all</i> of the
-  * matching documents.  The high-level search API ({@link
-  * Searcher#search(Query, int)}) is usually more efficient, as it skips
-  * non-high-scoring hits.
-  * <p>Note: The <code>score</code> passed to this method is a raw score.
-  * In other words, the score will not necessarily be a float whose value is
-  * between 0 and 1.
-  * @throws BooleanQuery.TooManyClauses
-  */
+   *
+   * <p>{@link Collector#collect(int)} is called for every matching document.
+   *
+   * <p>Applications should only use this if they need <i>all</i> of the
+   * matching documents.  The high-level search API ({@link
+   * Searcher#search(Query, int)}) is usually more efficient, as it skips
+   * non-high-scoring hits.
+   * <p>Note: The <code>score</code> passed to this method is a raw score.
+   * In other words, the score will not necessarily be a float whose value is
+   * between 0 and 1.
+   * @throws BooleanQuery.TooManyClauses
+   */
   @Override
   public void search(Query query, Collector results)
-    throws IOException {
+      throws IOException {
     search(createNormalizedWeight(query), null, results);
   }
-  
+
   /** Search implementation with arbitrary sorting.  Finds
    * the top <code>n</code> hits for <code>query</code>, applying
    * <code>filter</code> if non-null, and sorting the hits by the criteria in
@@ -396,7 +403,7 @@ public class IndexSearcher extends Searcher {
    */
   @Override
   public TopFieldDocs search(Query query, Filter filter, int n,
-                             Sort sort) throws IOException {
+      Sort sort) throws IOException {
     return search(createNormalizedWeight(query), filter, n, sort);
   }
 
@@ -410,7 +417,7 @@ public class IndexSearcher extends Searcher {
    */
   @Override
   public TopFieldDocs search(Query query, int n,
-                             Sort sort) throws IOException {
+      Sort sort) throws IOException {
     return search(createNormalizedWeight(query), null, n, sort);
   }
 
@@ -425,7 +432,7 @@ public class IndexSearcher extends Searcher {
   public TopDocs search(Weight weight, Filter filter, int nDocs) throws IOException {
     return search(weight, filter, null, nDocs);
   }
-  
+
   /**
    * Expert: Low-level search implementation.  Finds the top <code>n</code>
    * hits for <code>query</code>, applying <code>filter</code> if non-null,
@@ -448,10 +455,10 @@ public class IndexSearcher extends Searcher {
       final HitQueue hq = new HitQueue(nDocs, false);
       final Lock lock = new ReentrantLock();
       final ExecutionHelper<TopDocs> runner = new ExecutionHelper<TopDocs>(executor);
-    
+
       for (int i = 0; i < subReaders.length; i++) { // search each sub
         runner.submit(
-                      new MultiSearcherCallableNoSort(lock, subSearchers[i], weight, filter, after, nDocs, hq));
+            new MultiSearcherCallableNoSort(lock, subSearchers[i], weight, filter, after, nDocs, hq));
       }
 
       int totalHits = 0;
@@ -499,8 +506,8 @@ public class IndexSearcher extends Searcher {
    * Collector)}.</p>
    */
   protected TopFieldDocs search(Weight weight, Filter filter, int nDocs,
-                                Sort sort, boolean fillFields)
-      throws IOException {
+      Sort sort, boolean fillFields)
+          throws IOException {
 
     if (sort == null) throw new NullPointerException();
 
@@ -513,21 +520,21 @@ public class IndexSearcher extends Searcher {
       nDocs = Math.min(nDocs, limit);
 
       TopFieldCollector collector = TopFieldCollector.create(sort, nDocs,
-                                                             fillFields, fieldSortDoTrackScores, fieldSortDoMaxScore, !weight.scoresDocsOutOfOrder());
+          fillFields, fieldSortDoTrackScores, fieldSortDoMaxScore, !weight.scoresDocsOutOfOrder());
       search(weight, filter, collector);
       return (TopFieldDocs) collector.topDocs();
     } else {
       final TopFieldCollector topCollector = TopFieldCollector.create(sort, nDocs,
-                                                                      fillFields,
-                                                                      fieldSortDoTrackScores,
-                                                                      fieldSortDoMaxScore,
-                                                                      false);
+          fillFields,
+          fieldSortDoTrackScores,
+          fieldSortDoMaxScore,
+          false);
 
       final Lock lock = new ReentrantLock();
       final ExecutionHelper<TopFieldDocs> runner = new ExecutionHelper<TopFieldDocs>(executor);
       for (int i = 0; i < subReaders.length; i++) { // search each sub
         runner.submit(
-                      new MultiSearcherCallableWithSort(lock, subSearchers[i], weight, filter, nDocs, topCollector, sort));
+            new MultiSearcherCallableWithSort(lock, subSearchers[i], weight, filter, nDocs, topCollector, sort));
       }
       int totalHits = 0;
       float maxScore = Float.NEGATIVE_INFINITY;
@@ -575,13 +582,75 @@ public class IndexSearcher extends Searcher {
     for (int i = 0; i < subReaders.length; i++) { // search each subreader
       collector.setNextReader(subReaders[i], docBase + docStarts[i]);
       final Scorer scorer = (filter == null) ?
-        weight.scorer(subReaders[i], !collector.acceptsDocsOutOfOrder(), true) :
-        FilteredQuery.getFilteredScorer(subReaders[i], getSimilarity(), weight, weight, filter);
-      if (scorer != null) {
-        scorer.score(collector);
-      }
+          weight.scorer(subReaders[i], !collector.acceptsDocsOutOfOrder(), true) :
+            FilteredQuery.getFilteredScorer(subReaders[i], getSimilarity(), weight, weight, filter);
+          if (scorer != null) {
+            scorer.score(collector);
+          }
     }
   }
+
+  private static ForkJoinPool searchFJPool = new ForkJoinPool();
+
+  public <C extends Collector> Collection<C> searchParallel(final Weight weight, final Filter filter, final Callable<C> collectorFactory) throws IOException {
+    final List<C> collectors = new ArrayList<C>(subReaders.length);
+    final List<Callable<Void>> tasks = new ArrayList<Callable<Void>>(subReaders.length);
+
+    for (int i = 0; i < subReaders.length; i++) { // search each subreader
+      final C collector;
+      final IndexReader reader = subReaders[i];
+
+      IndexReader[] subs = reader.getSequentialSubReaders();
+      
+      if (subs != null && subs.length > 0)
+        throw new IllegalStateException("non-atomic subreader " + reader);
+      
+      try {
+        collector = collectorFactory.call();
+      } catch (IOException e) {
+        throw e;
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+
+      collector.setNextReader(reader, docBase + docStarts[i]);
+
+      collectors.add(collector);
+
+      Callable<Void> task = new Callable<Void>() {
+
+        @Override
+        public Void call() throws IOException {
+          final Scorer scorer = (filter == null) ?
+              weight.scorer(reader, !collector.acceptsDocsOutOfOrder(), true) :
+                FilteredQuery.getFilteredScorer(reader, getSimilarity(), weight, weight, filter);
+
+              if (scorer != null) {
+                scorer.score(collector);
+              }
+
+              return null;
+        }
+      };
+
+      tasks.add(task);
+    }
+
+    List<Future<Void>> futures = searchFJPool.invokeAll(tasks);
+    
+    try {
+      for (Future<Void> f: futures)
+        f.get();
+    } catch (Exception e) {
+      if (e instanceof IOException)
+        throw (IOException)e;
+      else
+        throw new RuntimeException(e);
+    }
+
+    return collectors;
+  }
+
 
   /** Expert: called to re-write queries into primitive queries.
    * @throws BooleanQuery.TooManyClauses
@@ -590,7 +659,7 @@ public class IndexSearcher extends Searcher {
   public Query rewrite(Query original) throws IOException {
     Query query = original;
     for (Query rewrittenQuery = query.rewrite(reader); rewrittenQuery != query;
-         rewrittenQuery = query.rewrite(reader)) {
+        rewrittenQuery = query.rewrite(reader)) {
       query = rewrittenQuery;
     }
     return query;
@@ -624,7 +693,7 @@ public class IndexSearcher extends Searcher {
   public Explanation explain(Weight weight, int doc) throws IOException {
     int n = ReaderUtil.subIndex(doc, docStarts);
     int deBasedDoc = doc - docStarts[n];
-    
+
     return weight.explain(subReaders[n], deBasedDoc);
   }
 
@@ -729,7 +798,7 @@ public class IndexSearcher extends Searcher {
     private final Sort sort;
 
     public MultiSearcherCallableWithSort(Lock lock, IndexSearcher searchable, Weight weight,
-                                         Filter filter, int nDocs, TopFieldCollector hq, Sort sort) {
+        Filter filter, int nDocs, TopFieldCollector hq, Sort sort) {
       this.lock = lock;
       this.searchable = searchable;
       this.weight = weight;
@@ -746,7 +815,7 @@ public class IndexSearcher extends Searcher {
       public FakeScorer() {
         super(null, null);
       }
-    
+
       @Override
       public int advance(int target) {
         throw new UnsupportedOperationException();
@@ -766,7 +835,7 @@ public class IndexSearcher extends Searcher {
       public int nextDoc() {
         throw new UnsupportedOperationException();
       }
-    
+
       @Override
       public float score() {
         return score;
