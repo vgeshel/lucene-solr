@@ -1226,7 +1226,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     final ProcessedFilter pf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
     final Filter luceneFilter = pf.filter;
 
-    log.info("running query {} ({}) with filter {} in parallel over {} readers", 
+    log.debug("running query {} ({}) with filter {} in parallel over {} readers", 
         new Object[]{query, cmd.getQuery(), luceneFilter, getSubReaders().length});
     
     // must create normalized weight using the top-level searcher
@@ -1362,7 +1362,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
           maxScore = Math.max(maxScore, topDocs.getMaxScore());
         }
         
-        log.info("collector {} of {} found docs: {}",
+        log.debug("collector {} of {} found docs: {}",
             new Object[]{i, getSubReaders().length, topDocs.scoreDocs});
       }
 
@@ -1408,6 +1408,9 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
     Query query = QueryUtils.makeQueryable(cmd.getQuery());
     final long timeAllowed = cmd.getTimeAllowed();
+
+    log.debug("running query {} ({}) with filter {} in parallel over {} readers", 
+        new Object[]{query, cmd.getQuery(), luceneFilter, getSubReaders().length});
 
     // handle zero case...
     if (lastDocRequested<=0) {

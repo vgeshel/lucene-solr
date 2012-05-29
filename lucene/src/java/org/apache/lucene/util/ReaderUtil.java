@@ -111,13 +111,19 @@ public final class ReaderUtil {
   public static void visitReaders(Collection<IndexReader> readers, ReaderVisitor v) {
     if (readers.size() == 0) {
       return;
-    } else if (readers.size() == 1) {
-      v.visit(readers.iterator().next());
     } else {
       final List<IndexReader> subs = new ArrayList<IndexReader>(readers.size() * 2);
 
       for (IndexReader r: readers) {
         gatherSubReaders(subs, r);
+      }
+      
+      if (subs.size() == 0)
+        return;
+      
+      if (subs.size() == 1) {
+        v.visit(subs.iterator().next());
+        return;
       }
 
       final List<ReaderAction> tasks = new ArrayList<ReaderAction>(subs.size());
