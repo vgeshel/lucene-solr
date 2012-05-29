@@ -25,6 +25,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.RecursiveAction;
 import java.util.concurrent.RecursiveTask;
@@ -65,11 +66,7 @@ public final class ReaderUtil {
     void visit(IndexReader r);
   }
 
-  private static class ReaderAction extends RecursiveAction {
-    /**
-     * 
-     */
-    private static final long serialVersionUID = -5820240087339249330L;
+  private static class ReaderAction implements Callable<IndexReader> {
     private ReaderVisitor v;
     private IndexReader r;
 
@@ -79,20 +76,12 @@ public final class ReaderUtil {
     }
 
     @Override
-    protected void compute() {
-      IndexReader[] subs = r.getSequentialSubReaders();
-
-      if (subs == null || subs.length == 0) {
-        v.visit(r);
-      } else {
-        List<ReaderAction> tasks = new ArrayList<ReaderAction>(subs.length);
-
-        for (int i = 0; i < subs.length; i ++) {
-          tasks.add(new ReaderAction(v, subs[i]));
-        }
-
-        invokeAll(tasks);
-      }
+    public IndexReader call() {
+      assert r.getSequentialSubReaders() == null || r.getSequentialSubReaders().length == 0;
+      
+      v.visit(r);
+      
+      return r;
     }
 
   }
@@ -126,19 +115,13 @@ public final class ReaderUtil {
         return;
       }
 
-      final List<ReaderAction> tasks = new ArrayList<ReaderAction>(subs.size());
+      final List<Callable<IndexReader>> tasks = new ArrayList<Callable<IndexReader>>(subs.size());
 
       for (IndexReader r: subs) {
         tasks.add(new ReaderAction(v, r));
       }
 
-      fjPool.invoke(new RecursiveAction() {
-
-        @Override
-        protected void compute() {
-          invokeAll(tasks);
-        }
-      });
+      fjPool.invokeAll(tasks);
     }
   }
 
