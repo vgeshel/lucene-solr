@@ -1226,6 +1226,9 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     final ProcessedFilter pf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
     final Filter luceneFilter = pf.filter;
 
+    log.info("running query {} ({}) with filter {} in parallel over {} readers", 
+        new Object[]{query, cmd.getQuery(), luceneFilter, getSubReaders().length});
+    
     // must create normalized weight using the top-level searcher
     Weight weight = createNormalizedWeight(query);
 
@@ -1317,7 +1320,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
           if (cmd.getSort() == null) {
             topCollector = TopScoreDocCollector.create(len, true);
           } else {
-            topCollector = TopFieldCollector.create(weightSort(cmd.getSort()), len, false, needScores, needScores, true);
+            topCollector = TopFieldCollector.create(weightSort(cmd.getSort()), len, true, needScores, needScores, true);
           }
           Collector collector = topCollector;
           if( timeAllowed > 0 ) {
@@ -1345,6 +1348,8 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       // invokeAll tasks and wait for up to timeAllowed
 
       // aggregate results. use TopDocs.merge
+      assert tdCollectors.size() == getSubReaders().length;
+      
       TopDocs[] topDocsArr = new TopDocs[tdCollectors.size()];
 
       for (int i = 0; ! tdCollectors.isEmpty(); i ++) {
@@ -1356,6 +1361,9 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
         if (topCollector.getTotalHits() > 0) {
           maxScore = Math.max(maxScore, topDocs.getMaxScore());
         }
+        
+        log.info("collector {} of {} found docs: {}",
+            new Object[]{i, getSubReaders().length, topDocs.scoreDocs});
       }
 
       TopDocs topDocs = TopDocs.merge(cmd.getSort(), len, topDocsArr);

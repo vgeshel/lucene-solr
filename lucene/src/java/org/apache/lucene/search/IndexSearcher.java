@@ -601,16 +601,21 @@ public class IndexSearcher extends Searcher {
       final IndexReader reader = subReaders[i];
 
       IndexReader[] subs = reader.getSequentialSubReaders();
-      
+
       if (subs != null && subs.length > 0)
         throw new IllegalStateException("non-atomic subreader " + reader);
-      
+
       try {
         collector = collectorFactory.call();
       } catch (IOException e) {
         throw e;
       } catch (Exception e) {
-        throw new RuntimeException(e);
+        if (e instanceof RuntimeException) {
+          RuntimeException re = (RuntimeException) e;
+          throw re;
+        } else {
+          throw new RuntimeException(e);
+        }
       }
 
       collector.setNextReader(reader, docBase + docStarts[i]);
@@ -637,15 +642,22 @@ public class IndexSearcher extends Searcher {
     }
 
     List<Future<Void>> futures = searchFJPool.invokeAll(tasks);
-    
+
     try {
       for (Future<Void> f: futures)
         f.get();
-    } catch (Exception e) {
-      if (e instanceof IOException)
+    } catch (ExecutionException ee) {
+      Throwable e = ee.getCause();
+      
+      if (e instanceof IOException) {
         throw (IOException)e;
-      else
+      } else if (e instanceof RuntimeException) {
+        throw (RuntimeException)e;
+      } else {
         throw new RuntimeException(e);
+      }
+    } catch (InterruptedException e) {
+      throw new RuntimeException(e);
     }
 
     return collectors;
