@@ -1315,8 +1315,10 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
             collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
           }
           if (pf.postFilter != null) {
-            pf.postFilter.setLastDelegate(collector);
-            collector = pf.postFilter;
+            // we have to create a separate post filter here because it's mutable  
+            final ProcessedFilter localpf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
+            localpf.postFilter.setLastDelegate(collector);
+            collector = localpf.postFilter;
           }
 
           return collector;
@@ -1354,8 +1356,10 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
             collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed);
           }
           if (pf.postFilter != null) {
-            pf.postFilter.setLastDelegate(collector);
-            collector = pf.postFilter;
+            // we have to create a separate post filter here because it's mutable  
+            final ProcessedFilter localpf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
+            localpf.postFilter.setLastDelegate(collector);
+            collector = localpf.postFilter;
           }
 
           tdCollectors.add(topCollector);
