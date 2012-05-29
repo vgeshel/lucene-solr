@@ -32,6 +32,8 @@ import org.apache.solr.core.SolrCore;
 import org.apache.solr.core.SolrInfoMBean;
 import org.apache.solr.schema.IndexSchema;
 import org.apache.solr.schema.SchemaField;
+import org.apache.solr.search.function.ValueSourceScorer;
+import org.apache.solr.search.function.ValueSource.ValueSourceSortField;
 import org.apache.solr.request.UnInvertedField;
 import org.apache.lucene.util.OpenBitSet;
 
@@ -1366,7 +1368,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
             new Object[]{i, getSubReaders().length, topDocs.scoreDocs});
       }
 
-      TopDocs topDocs = TopDocs.merge(cmd.getSort(), len, topDocsArr);
+      TopDocs topDocs = TopDocs.merge(weightSort(cmd.getSort()), len, topDocsArr);
 
       nDocsReturned = topDocs.scoreDocs.length;
 
