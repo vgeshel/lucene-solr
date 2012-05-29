@@ -1432,7 +1432,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     float maxScore = Float.NEGATIVE_INFINITY;
     int[] ids;
     float[] scores;
-    DocSet set;
+    final DocSet set;
 
     final boolean needScores = (cmd.getFlags() & GET_SCORES) != 0;
     final int maxDoc = maxDoc();
@@ -1520,7 +1520,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       maxScore = totalHits>0 ? topscore.get() : 0.0f;
     } else {
       final ConcurrentLinkedQueue<TopDocsCollector> tdCollectors = new ConcurrentLinkedQueue<TopDocsCollector>();
-      final DocSetCollector setCollector = new DocSetCollector(maxDoc>>6, maxDoc);
+      set = new BitDocSet();
       final Lock setCollectorLock = new ReentrantLock();
 
       Callable<Collector> collectorFactory = new Callable<Collector>() {
@@ -1543,16 +1543,10 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
             collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed );
           }
 
-          if (pf.postFilter != null) {
-            // we have to create a separate post filter here because it's mutable  
-            final ProcessedFilter localpf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
-            localpf.postFilter.setLastDelegate(collector);
-            collector = localpf.postFilter;
-          }
-
           final Collector finalCollector = collector;
           
-          return new Collector() {
+          // hook in a collector to update the docset. this has to be after the postfilter (see below), otherwise we'll get false positives
+          collector = new Collector() {
             IndexReader reader;
             int docBase;
             
@@ -1565,15 +1559,18 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
             public void setNextReader(IndexReader reader, int docBase) throws IOException {
               this.reader = reader;
               this.docBase = docBase;
+              
+              finalCollector.setNextReader(reader, docBase);
             }
             
             @Override
             public void collect(int doc) throws IOException {
+              finalCollector.collect(doc);
+              
               setCollectorLock.lock();
               
               try {
-                setCollector.setNextReader(reader, docBase);
-                setCollector.collect(doc);
+                set.add(docBase + doc);
               } finally {
                 setCollectorLock.unlock();
               }
@@ -1581,10 +1578,18 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
             
             @Override
             public boolean acceptsDocsOutOfOrder() {
-              return setCollector.acceptsDocsOutOfOrder();
+              return finalCollector.acceptsDocsOutOfOrder();
             }
           };
-          
+
+          if (pf.postFilter != null) {
+            // we have to create a separate post filter here because it's mutable  
+            final ProcessedFilter localpf = getProcessedFilter(cmd.getFilter(), cmd.getFilterList());
+            localpf.postFilter.setLastDelegate(collector);
+            collector = localpf.postFilter;
+          }
+
+          return collector;
         }
       };
       
@@ -1595,8 +1600,6 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
         log.warn( "Query: " + query + "; " + x.getMessage() );
         qr.setPartialResults(true);
       }
-
-      set = setCollector.getDocSet();      
 
       // aggregate results. use TopDocs.merge
       assert tdCollectors.size() == getSubReaders().length;
@@ -1615,6 +1618,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
         log.debug("collector {} of {} found docs: {}",
             new Object[]{i, getSubReaders().length, topDocs.scoreDocs});
+
       }
 
       TopDocs topDocs = TopDocs.merge(sort, len, topDocsArr);
@@ -1622,7 +1626,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       nDocsReturned = topDocs.scoreDocs.length;
 
       assert(totalHits == set.size());
-
+      
       nDocsReturned = topDocs.scoreDocs.length;
 
       ids = new int[nDocsReturned];
