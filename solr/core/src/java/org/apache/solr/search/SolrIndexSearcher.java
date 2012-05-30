@@ -700,52 +700,63 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
    * The DocSet returned should <b>not</b> be modified.
    */
   public DocSet getDocSet(List<Query> queries) throws IOException {
-    ProcessedFilter pf = getProcessedFilter(null, queries);
+    final ProcessedFilter pf = getProcessedFilter(null, queries);
     if (pf.answer != null) return pf.answer;
 
 
-    DocSetCollector setCollector = new DocSetCollector(maxDoc()>>6, maxDoc());
-    Collector collector = setCollector;
-    if (pf.postFilter != null) {
-      pf.postFilter.setLastDelegate(collector);
-      collector = pf.postFilter;
-    }
-
+    final ConcurrentDocSet docSet = new ConcurrentDocSet();
     final SolrIndexReader[] leaves = reader.getLeafReaders();
-    final int offsets[] = reader.getLeafOffsets();
 
-    for (int i=0; i<leaves.length; i++) {
-      SolrIndexReader subReader = leaves[i];
-      int baseDoc = offsets[i];
-      DocIdSet idSet = null;
-      if (pf.filter != null) {
-        idSet = pf.filter.getDocIdSet(subReader);
-        if (idSet == null) continue;
-      }
-      DocIdSetIterator idIter = null;
-      if (idSet != null) {
-        idIter = idSet.iterator();
-        if (idIter == null) continue;
-      }
-
-      collector.setNextReader(subReader, baseDoc);
-      int max = subReader.maxDoc();
-
-      if (idIter == null) {
-        TermDocs tdocs = subReader.termDocs(null);
-        while (tdocs.next()) {
-          int docid = tdocs.doc();
-          collector.collect(docid);
+    ReaderVisitor v = new ReaderVisitor() {
+      
+      @Override
+      public void visit(IndexReader subReader) {
+        int baseDoc = reader.getLeafOffsetMap().get(subReader);
+        
+        Collector setCollector = docSet.call();
+        
+        Collector collector = setCollector;
+        if (pf.postFilter != null) {
+          pf.postFilter.setLastDelegate(collector);
+          collector = pf.postFilter;
         }
-      } else {
-        for (int docid = -1; (docid = idIter.advance(docid+1)) < max; ) {
-          if (subReader.isDeleted(docid)) continue;
-          collector.collect(docid);
+
+        try {
+          DocIdSet idSet = null;
+          if (pf.filter != null) {
+            idSet = pf.filter.getDocIdSet(subReader);
+            if (idSet == null) return;
+          }
+          DocIdSetIterator idIter = null;
+          if (idSet != null) {
+            idIter = idSet.iterator();
+            if (idIter == null) return;
+          }
+
+          collector.setNextReader(subReader, baseDoc);
+          int max = subReader.maxDoc();
+
+          if (idIter == null) {
+            TermDocs tdocs = subReader.termDocs(null);
+            while (tdocs.next()) {
+              int docid = tdocs.doc();
+              collector.collect(docid);
+            }
+          } else {
+            for (int docid = -1; (docid = idIter.advance(docid+1)) < max; ) {
+              if (subReader.isDeleted(docid)) continue;
+              collector.collect(docid);
+            }
+          }
+        } catch (IOException e) {
+          throw new RuntimeException(e);
         }
       }
-    }
-
-    return setCollector.getDocSet();
+    };
+    
+    ReaderUtil.visitReaders(leaves, v );
+    
+    return docSet.docSet();
   }
 
 
@@ -857,8 +868,8 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     return pf;
   }
 
-  private static class ConcurrentDocSet implements Callable<Collector> {
-    private final BitDocSet docSet = new BitDocSet();
+  private class ConcurrentDocSet implements Callable<Collector> {
+    private final BitDocSet docSet = new BitDocSet(new OpenBitSet(maxDoc()));
     private final Lock lock = new ReentrantLock();
 
     public void add(int doc, int base) {
@@ -870,31 +881,31 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
         lock.unlock();
       }
     }
-    
+
     public DocSet docSet() {
       return docSet;
     }
 
     @Override
-    public Collector call() throws Exception {
+    public Collector call() {
       return new Collector() {
         int docBase;
-        
+
         @Override
         public void setScorer(Scorer scorer) throws IOException {
-          
+
         }
-        
+
         @Override
         public void setNextReader(IndexReader reader, int docBase) throws IOException {
           this.docBase = docBase;
         }
-        
+
         @Override
         public void collect(int doc) throws IOException {
           add(doc, docBase);
         }
-        
+
         @Override
         public boolean acceptsDocsOutOfOrder() {
           return true;
@@ -902,7 +913,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       };
     }
   }
-
+  
   // query must be positive
   protected DocSet getDocSetNC(Query query, DocSet filter) throws IOException {
     final ConcurrentDocSet cds = new ConcurrentDocSet();
@@ -911,18 +922,18 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       if (query instanceof TermQuery) {
         final Term t = ((TermQuery)query).getTerm();
         SolrIndexReader[] readers = reader.getLeafReaders();
-        
+
         ReaderVisitor v = new ReaderVisitor() {
 
           @Override
           public void visit(IndexReader r) {
             int offset = reader.getLeafOffsetMap().get(r);
-            
+
             try {
               TermDocs tdocs = r.termDocs(t);
               int[] arr = new int[256];
               int[] freq = new int[256];
-              
+
               for(;;) {
                 int num = tdocs.read(arr, freq);
                 if (num==0) break;
@@ -945,7 +956,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       Filter luceneFilter = filter.getTopFilter();
       super.searchParallel(createNormalizedWeight(query), luceneFilter, cds);
     }
-    
+
     return cds.docSet();
   }
 
@@ -957,46 +968,47 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
   // query must be positive
   protected DocSet getDocSetNC(Query query, DocSet filter, TermDocsState tdState) throws IOException {
-    int smallSetSize = maxDoc()>>6;
-            int largestPossible = tdState.tenum.docFreq();
-            int[] docs = new int[Math.min(smallSetSize, largestPossible)];
-            OpenBitSet obs = null;
-            int upto=0;
-            int numBits = 0;
+    int smallSetSize = (maxDoc() >> 6);
 
-            if (tdState.tdocs == null) {
-              tdState.tdocs = reader.termDocs();
-            }
+    int largestPossible = tdState.tenum.docFreq();
+    int[] docs = new int[Math.min(smallSetSize, largestPossible)];
+    OpenBitSet obs = null;
+    int upto=0;
+    int numBits = 0;
 
-            tdState.tdocs.seek(tdState.tenum);
+    if (tdState.tdocs == null) {
+      tdState.tdocs = reader.termDocs();
+    }
 
-            int[] arr = new int[Math.min(largestPossible, 256)];
-            int[] freq = new int[arr.length];
+    tdState.tdocs.seek(tdState.tenum);
 
-            for(;;) {
-              int num = tdState.tdocs.read(arr, freq);
-              if (num==0) break;
-              if (upto + num > docs.length) {
-                if (obs == null) obs = new OpenBitSet(maxDoc());
-                for (int i = 0; i<num; i++) {
-                  obs.fastSet(arr[i]);
-                }
-                numBits += num;
-              } else {
-                System.arraycopy(arr, 0, docs, upto, num);
-                upto += num;
-              }
-            }
+    int[] arr = new int[Math.min(largestPossible, 256)];
+    int[] freq = new int[arr.length];
 
-            if (obs != null) {
-              for (int i=0; i<upto; i++) {
-                obs.fastSet(docs[i]);
-              }
-              numBits += upto;
-              return new BitDocSet(obs, numBits);
-            }
+    for(;;) {
+      int num = tdState.tdocs.read(arr, freq);
+      if (num==0) break;
+      if (upto + num > docs.length) {
+        if (obs == null) obs = new OpenBitSet(maxDoc());
+        for (int i = 0; i<num; i++) {
+          obs.fastSet(arr[i]);
+        }
+        numBits += num;
+      } else {
+        System.arraycopy(arr, 0, docs, upto, num);
+        upto += num;
+      }
+    }
 
-            return new SortedIntDocSet(docs, upto);
+    if (obs != null) {
+      for (int i=0; i<upto; i++) {
+        obs.fastSet(docs[i]);
+      }
+      numBits += upto;
+      return new BitDocSet(obs, numBits);
+    }
+
+    return new SortedIntDocSet(docs, upto);
   }
 
 
