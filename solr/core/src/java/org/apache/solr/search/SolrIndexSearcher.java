@@ -65,6 +65,8 @@ import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.OpenBitSet;
+import org.apache.lucene.util.ReaderUtil;
+import org.apache.lucene.util.ReaderUtil.ReaderVisitor;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SimpleOrderedMap;
 import org.apache.solr.core.SolrConfig;
@@ -855,41 +857,96 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     return pf;
   }
 
+  private static class ConcurrentDocSet implements Callable<Collector> {
+    private final BitDocSet docSet = new BitDocSet();
+    private final Lock lock = new ReentrantLock();
+
+    public void add(int doc, int base) {
+      lock.lock();
+
+      try {
+        docSet.add(doc + base);
+      } finally {
+        lock.unlock();
+      }
+    }
+    
+    public DocSet docSet() {
+      return docSet;
+    }
+
+    @Override
+    public Collector call() throws Exception {
+      return new Collector() {
+        int docBase;
+        
+        @Override
+        public void setScorer(Scorer scorer) throws IOException {
+          
+        }
+        
+        @Override
+        public void setNextReader(IndexReader reader, int docBase) throws IOException {
+          this.docBase = docBase;
+        }
+        
+        @Override
+        public void collect(int doc) throws IOException {
+          add(doc, docBase);
+        }
+        
+        @Override
+        public boolean acceptsDocsOutOfOrder() {
+          return true;
+        }
+      };
+    }
+  }
+
   // query must be positive
   protected DocSet getDocSetNC(Query query, DocSet filter) throws IOException {
-    DocSetCollector collector = new DocSetCollector(maxDoc()>>6, maxDoc());
+    final ConcurrentDocSet cds = new ConcurrentDocSet();
 
     if (filter==null) {
       if (query instanceof TermQuery) {
-        Term t = ((TermQuery)query).getTerm();
+        final Term t = ((TermQuery)query).getTerm();
         SolrIndexReader[] readers = reader.getLeafReaders();
-        int[] offsets = reader.getLeafOffsets();
-        int[] arr = new int[256];
-        int[] freq = new int[256];
-        for (int i=0; i<readers.length; i++) {
-          SolrIndexReader sir = readers[i];
-          int offset = offsets[i];
-          collector.setNextReader(sir, offset);
-          TermDocs tdocs = sir.termDocs(t);
-          for(;;) {
-            int num = tdocs.read(arr, freq);
-            if (num==0) break;
-            for (int j=0; j<num; j++) {
-              collector.collect(arr[j]);
+        
+        ReaderVisitor v = new ReaderVisitor() {
+
+          @Override
+          public void visit(IndexReader r) {
+            int offset = reader.getLeafOffsetMap().get(r);
+            
+            try {
+              TermDocs tdocs = r.termDocs(t);
+              int[] arr = new int[256];
+              int[] freq = new int[256];
+              
+              for(;;) {
+                int num = tdocs.read(arr, freq);
+                if (num==0) break;
+                for (int j=0; j<num; j++) {
+                  cds.add(arr[j], offset);
+                }
+              }
+              tdocs.close();
+            } catch (IOException e) {
+              throw new RuntimeException(e);
             }
           }
-          tdocs.close();
-        }
-      } else {
-        super.search(query,null,collector);
-      }
-      return collector.getDocSet();
+        };
 
+        ReaderUtil.visitReaders(readers, v);        
+      } else {
+        super.searchParallel(createNormalizedWeight(query), null, cds);
+      }
     } else {
       Filter luceneFilter = filter.getTopFilter();
-      super.search(query, luceneFilter, collector);
-      return collector.getDocSet();
+      super.searchParallel(createNormalizedWeight(query), luceneFilter, cds);
     }
+    
+    return cds.docSet();
   }
 
   /** @lucene.internal */
@@ -1534,7 +1591,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
           } else {
             topCollector = TopFieldCollector.create(weightSort(cmd.getSort()), len, false, needScores, needScores, true);
           }
-          
+
           tdCollectors.add(topCollector);
 
           Collector collector = topCollector;
@@ -1544,38 +1601,38 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
           }
 
           final Collector finalCollector = collector;
-          
+
           // hook in a collector to update the docset. this has to be after the postfilter (see below), otherwise we'll get false positives
           collector = new Collector() {
             IndexReader reader;
             int docBase;
-            
+
             @Override
             public void setScorer(Scorer scorer) throws IOException {
               finalCollector.setScorer(scorer);
             }
-            
+
             @Override
             public void setNextReader(IndexReader reader, int docBase) throws IOException {
               this.reader = reader;
               this.docBase = docBase;
-              
+
               finalCollector.setNextReader(reader, docBase);
             }
-            
+
             @Override
             public void collect(int doc) throws IOException {
               finalCollector.collect(doc);
-              
+
               setCollectorLock.lock();
-              
+
               try {
                 set.add(docBase + doc);
               } finally {
                 setCollectorLock.unlock();
               }
             }
-            
+
             @Override
             public boolean acceptsDocsOutOfOrder() {
               return finalCollector.acceptsDocsOutOfOrder();
@@ -1592,7 +1649,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
           return collector;
         }
       };
-      
+
       try {
         super.searchParallel(weight, luceneFilter, collectorFactory);
       }
@@ -1626,7 +1683,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       nDocsReturned = topDocs.scoreDocs.length;
 
       assert(totalHits == set.size());
-      
+
       nDocsReturned = topDocs.scoreDocs.length;
 
       ids = new int[nDocsReturned];

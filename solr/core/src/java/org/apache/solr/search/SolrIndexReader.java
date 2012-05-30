@@ -26,7 +26,9 @@ import org.apache.lucene.document.FieldSelector;
 
 import java.io.IOException;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Map;
 
 /** Solr wrapper for IndexReader that contains extra context.
@@ -36,6 +38,7 @@ public class SolrIndexReader extends FilterIndexReader {
   private final SolrIndexReader[] subReaders;
   private final SolrIndexReader[] leafReaders;
   private int[] leafOffsets;
+  private final Map<IndexReader, Integer> leafOffsetMap;
   private final SolrIndexReader parent;
   private final int base; // docid offset of this reader within parent
 
@@ -63,19 +66,24 @@ public class SolrIndexReader extends FilterIndexReader {
       subReaders = new SolrIndexReader[subs.length]; 
       int numLeaves = subs.length;
       leafOffsets = new int[numLeaves];
+      IdentityHashMap<IndexReader, Integer> lom = new IdentityHashMap<IndexReader, Integer>(numLeaves);
       int b=0;
       for (int i=0; i<subReaders.length; i++) {
         SolrIndexReader sir = subReaders[i] = new SolrIndexReader(subs[i], this, b);
         leafOffsets[i] = b;
+        lom.put(sir, b);
+        lom.put(subs[i], b);
         b += sir.maxDoc();
         IndexReader subLeaves[] = sir.leafReaders;
         numLeaves += subLeaves.length - 1;  // subtract 1 for the parent
       }
       leafReaders = getLeaves(numLeaves);
+      leafOffsetMap = Collections.unmodifiableMap(lom);
     } else {
       subReaders = null;
       leafReaders = new SolrIndexReader[]{this};
       leafOffsets = zeroIntArray;
+      leafOffsetMap = Collections.emptyMap();
     }
 
   }
@@ -493,6 +501,10 @@ public class SolrIndexReader extends FilterIndexReader {
   @Override
   public int getTermInfosIndexDivisor() {
     return in.getTermInfosIndexDivisor();
+  }
+
+  public Map<IndexReader, Integer> getLeafOffsetMap() {
+    return leafOffsetMap;
   }
 }
 
