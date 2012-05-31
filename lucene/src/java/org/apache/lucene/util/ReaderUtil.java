@@ -52,7 +52,7 @@ public final class ReaderUtil {
    */
   public static void gatherSubReaders(List<IndexReader> allSubReaders, IndexReader reader) {
     IndexReader[] subReaders = reader.getSequentialSubReaders();
-    if (subReaders == null) {
+    if (subReaders == null || subReaders.length == 0) {
       // Add the reader itself, and do not recurse
       allSubReaders.add(reader);
     } else {

@@ -129,7 +129,7 @@ extends Query {
    * @param filter the Filter to wrap
    * @lucene.internal
    */
-  static Scorer getFilteredScorer(final IndexReader indexReader, final Similarity similarity,
+  static public Scorer getFilteredScorer(final IndexReader indexReader, final Similarity similarity,
                                   final Weight weight, final Weight wrapperWeight, final Filter filter) throws IOException {
     assert filter != null;
 

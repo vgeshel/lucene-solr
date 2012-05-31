@@ -19,21 +19,15 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletionService;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.Future;
-import java.util.concurrent.RecursiveAction;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -41,11 +35,11 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.document.FieldSelector;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.NIOFSDirectory; // javadocs
+import org.apache.lucene.store.NIOFSDirectory;
 import org.apache.lucene.util.ReaderUtil;
-import org.apache.lucene.util.ReaderUtil.ReaderVisitor;
 import org.apache.lucene.util.ThreadInterruptedException;
 
 /** Implements search over a single IndexReader.
@@ -588,79 +582,6 @@ public class IndexSearcher extends Searcher {
             scorer.score(collector);
           }
     }
-  }
-
-  private static ForkJoinPool searchFJPool = new ForkJoinPool();
-
-  public <C extends Collector> Collection<C> searchParallel(final Weight weight, final Filter filter, final Callable<C> collectorFactory) throws IOException {
-    final List<C> collectors = new ArrayList<C>(subReaders.length);
-    final List<Callable<Void>> tasks = new ArrayList<Callable<Void>>(subReaders.length);
-
-    for (int i = 0; i < subReaders.length; i++) { // search each subreader
-      final C collector;
-      final IndexReader reader = subReaders[i];
-
-      IndexReader[] subs = reader.getSequentialSubReaders();
-
-      if (subs != null && subs.length > 0)
-        throw new IllegalStateException("non-atomic subreader " + reader);
-
-      try {
-        collector = collectorFactory.call();
-      } catch (IOException e) {
-        throw e;
-      } catch (Exception e) {
-        if (e instanceof RuntimeException) {
-          RuntimeException re = (RuntimeException) e;
-          throw re;
-        } else {
-          throw new RuntimeException(e);
-        }
-      }
-
-      collector.setNextReader(reader, docBase + docStarts[i]);
-
-      collectors.add(collector);
-
-      Callable<Void> task = new Callable<Void>() {
-
-        @Override
-        public Void call() throws IOException {
-          final Scorer scorer = (filter == null) ?
-              weight.scorer(reader, !collector.acceptsDocsOutOfOrder(), true) :
-                FilteredQuery.getFilteredScorer(reader, getSimilarity(), weight, weight, filter);
-
-              if (scorer != null) {
-                scorer.score(collector);
-              }
-
-              return null;
-        }
-      };
-
-      tasks.add(task);
-    }
-
-    List<Future<Void>> futures = searchFJPool.invokeAll(tasks);
-
-    try {
-      for (Future<Void> f: futures)
-        f.get();
-    } catch (ExecutionException ee) {
-      Throwable e = ee.getCause();
-      
-      if (e instanceof IOException) {
-        throw (IOException)e;
-      } else if (e instanceof RuntimeException) {
-        throw (RuntimeException)e;
-      } else {
-        throw new RuntimeException(e);
-      }
-    } catch (InterruptedException e) {
-      throw new RuntimeException(e);
-    }
-
-    return collectors;
   }
 
 

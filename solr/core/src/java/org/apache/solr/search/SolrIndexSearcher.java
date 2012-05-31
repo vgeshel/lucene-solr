@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -48,6 +49,7 @@ import org.apache.lucene.search.DocIdSet;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.Filter;
+import org.apache.lucene.search.FilteredQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -521,6 +523,51 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
   ////////////////////////////////////////////////////////////////////////////////
   ////////////////////////////////////////////////////////////////////////////////
 
+  private static ForkJoinPool searchFJPool = new ForkJoinPool();
+
+  public <C extends Collector, CF extends Callable<C>> Collection<C> searchParallel(final Weight weight, final Filter filter, final CF collectorFactory) throws IOException {
+    final Collection<C> collectors = new ConcurrentLinkedQueue<C>();
+
+    ReaderVisitor v = new ReaderVisitor() {
+
+      @Override
+      public void visit(final IndexReader leafReader) {
+        final C collector;
+
+        try {
+          collector = collectorFactory.call();
+
+          collector.setNextReader(leafReader, reader.getLeafOffsetMap().get(leafReader));
+
+          collectors.add(collector);
+
+          final Scorer scorer = (filter == null) ?
+              weight.scorer(leafReader, !collector.acceptsDocsOutOfOrder(), true) :
+                FilteredQuery.getFilteredScorer(leafReader, getSimilarity(), weight, weight, filter);
+
+              if (scorer != null) {
+                scorer.score(collector);
+              }
+
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        } catch (Exception e) {
+          if (e instanceof RuntimeException) {
+            RuntimeException re = (RuntimeException) e;
+            throw re;
+          } else {
+            throw new RuntimeException(e);
+          }
+        }
+
+      }
+    };
+    ReaderUtil.visitReaders(reader.getLeafReaders(), v);
+
+    return collectors;
+  }
+
+
   /** expert: internal API, subject to change */
   public SolrCache getFieldValueCache() {
     return fieldValueCache;
@@ -699,27 +746,21 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
    * <p>
    * The DocSet returned should <b>not</b> be modified.
    */
-  public DocSet getDocSet(List<Query> queries) throws IOException {
+  public DocSet getDocSet(final List<Query> queries) throws IOException {
     final ProcessedFilter pf = getProcessedFilter(null, queries);
     if (pf.answer != null) return pf.answer;
 
-
-    final ConcurrentDocSet docSet = new ConcurrentDocSet();
-    final SolrIndexReader[] leaves = reader.getLeafReaders();
+    final ConcurrentDocSet docSet = new ConcurrentDocSet(maxDoc());
 
     ReaderVisitor v = new ReaderVisitor() {
-      
+
       @Override
       public void visit(IndexReader subReader) {
         int baseDoc = reader.getLeafOffsetMap().get(subReader);
-        
-        Collector setCollector = docSet.call();
-        
+
+        Collector setCollector = docSet.makeCollector();
+
         Collector collector = setCollector;
-        if (pf.postFilter != null) {
-          pf.postFilter.setLastDelegate(collector);
-          collector = pf.postFilter;
-        }
 
         try {
           DocIdSet idSet = null;
@@ -733,7 +774,15 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
             if (idIter == null) return;
           }
 
+          if (pf.postFilter != null) {
+            // we need to create a separate instance of PF for this thread
+            ProcessedFilter pf = getProcessedFilter(null, queries);
+            pf.postFilter.setLastDelegate(collector);
+            collector = pf.postFilter;
+          }
+
           collector.setNextReader(subReader, baseDoc);
+          
           int max = subReader.maxDoc();
 
           if (idIter == null) {
@@ -753,9 +802,9 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
         }
       }
     };
-    
-    ReaderUtil.visitReaders(leaves, v );
-    
+
+    ReaderUtil.visitReader(reader, v);
+
     return docSet.docSet();
   }
 
@@ -867,11 +916,20 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
     return pf;
   }
+  
+  private static final boolean isAtomic(IndexReader reader) {
+    IndexReader[] sequentialSubReaders = reader.getSequentialSubReaders();
+    return sequentialSubReaders == null || sequentialSubReaders.length == 0;
+  }
 
-  private class ConcurrentDocSet implements Callable<Collector> {
-    private final BitDocSet docSet = new BitDocSet(new OpenBitSet(maxDoc()));
+  private static class ConcurrentDocSet implements Callable<Collector> {
+    private final BitDocSet docSet;
     private final Lock lock = new ReentrantLock();
 
+    public ConcurrentDocSet(int maxDoc) {
+      docSet = new BitDocSet(new OpenBitSet(maxDoc)); 
+    }
+    
     public void add(int doc, int base) {
       lock.lock();
 
@@ -887,36 +945,77 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
     }
 
     @Override
-    public Collector call() {
-      return new Collector() {
-        int docBase;
+    public ConcurrentSetCollector call() {
+      return makeCollector();
+    }
 
-        @Override
-        public void setScorer(Scorer scorer) throws IOException {
+    public ConcurrentSetCollector makeDelegatingCollector(Collector delegate) {
+      return makeCollector(null, -1, delegate);
+    }
+    
+    public ConcurrentSetCollector makeCollector() {
+      return makeCollector(null, -1, null);
+    }
 
-        }
-
-        @Override
-        public void setNextReader(IndexReader reader, int docBase) throws IOException {
-          this.docBase = docBase;
-        }
-
-        @Override
-        public void collect(int doc) throws IOException {
-          add(doc, docBase);
-        }
-
-        @Override
-        public boolean acceptsDocsOutOfOrder() {
-          return true;
-        }
-      };
+    public ConcurrentSetCollector makeCollector(final IndexReader subReader, final int offset, final Collector delegate) {
+      return new ConcurrentSetCollector(delegate, offset, subReader, this);
     }
   }
-  
+
+  private static final class ConcurrentSetCollector extends Collector {
+    private final Collector delegate;
+    private final IndexReader subReader;
+    private int docBase;
+    private IndexReader r;
+    private final ConcurrentDocSet cds;
+
+    private ConcurrentSetCollector(Collector delegate, int offset,
+        IndexReader subReader,
+        ConcurrentDocSet cds) {
+      assert subReader == null || isAtomic(subReader);
+      
+      this.delegate = delegate;
+      this.subReader = subReader;
+      this.docBase = offset;
+      this.r = subReader;
+      this.cds = cds;
+    }
+
+    @Override
+    public void setScorer(Scorer scorer) throws IOException {
+      if (delegate != null)
+        delegate.setScorer(scorer);
+    }
+
+    @Override
+    public void setNextReader(IndexReader reader, int docBase) throws IOException {
+      assert this.docBase == -1 && this.r == null;
+      assert reader != null && isAtomic(reader);
+
+      this.docBase = docBase;
+      this.r = reader;
+      
+      if (delegate != null)
+        delegate.setNextReader(subReader, docBase);
+    }
+
+    @Override
+    public void collect(int doc) throws IOException {
+      cds.add(doc, docBase);
+      
+      if (delegate != null)
+        delegate.collect(doc);
+    }
+
+    @Override
+    public boolean acceptsDocsOutOfOrder() {
+      return delegate != null ? delegate.acceptsDocsOutOfOrder() : true;
+    }
+  }
+
   // query must be positive
   protected DocSet getDocSetNC(Query query, DocSet filter) throws IOException {
-    final ConcurrentDocSet cds = new ConcurrentDocSet();
+    final ConcurrentDocSet cds = new ConcurrentDocSet(maxDoc());
 
     if (filter==null) {
       if (query instanceof TermQuery) {
@@ -950,11 +1049,11 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
         ReaderUtil.visitReaders(readers, v);        
       } else {
-        super.searchParallel(createNormalizedWeight(query), null, cds);
+        searchParallel(createNormalizedWeight(query), null, cds);
       }
     } else {
       Filter luceneFilter = filter.getTopFilter();
-      super.searchParallel(createNormalizedWeight(query), luceneFilter, cds);
+      searchParallel(createNormalizedWeight(query), luceneFilter, cds);
     }
 
     return cds.docSet();
@@ -1399,7 +1498,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       };
 
       try {
-        super.searchParallel(weight, luceneFilter, collectorFactory);
+        searchParallel(weight, luceneFilter, collectorFactory);
       }
       catch( TimeLimitingCollector.TimeExceededException x ) {
         log.warn( "Query: " + query + "; " + x.getMessage() );
@@ -1442,7 +1541,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
       try {
         // use a subsearcher here instead of super
-        super.searchParallel(weight, luceneFilter, collectorFactory);
+        searchParallel(weight, luceneFilter, collectorFactory);
       }
       catch( TimeLimitingCollector.TimeExceededException x ) {
         log.warn( "Query: " + query + "; " + x.getMessage() );
@@ -1573,7 +1672,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       };
 
       try {
-        super.searchParallel(weight, luceneFilter, collectorFactory);
+        searchParallel(weight, luceneFilter, collectorFactory);
       }
       catch( TimeLimitingCollector.TimeExceededException x ) {
         log.warn( "Query: " + query + "; " + x.getMessage() );
@@ -1589,9 +1688,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       maxScore = totalHits>0 ? topscore.get() : 0.0f;
     } else {
       final ConcurrentLinkedQueue<TopDocsCollector> tdCollectors = new ConcurrentLinkedQueue<TopDocsCollector>();
-      set = new BitDocSet();
-      final Lock setCollectorLock = new ReentrantLock();
-
+      final ConcurrentDocSet cds = new ConcurrentDocSet(maxDoc());
       Callable<Collector> collectorFactory = new Callable<Collector>() {
 
         @Override
@@ -1608,48 +1705,12 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
           Collector collector = topCollector;
 
+          // hook in a collector to update the docset. this has to be after the postfilter (see below), otherwise we'll get false positives
+          collector = cds.makeDelegatingCollector(collector);
+
           if( timeAllowed > 0 ) {
             collector = new TimeLimitingCollector(collector, TimeLimitingCollector.getGlobalCounter(), timeAllowed );
           }
-
-          final Collector finalCollector = collector;
-
-          // hook in a collector to update the docset. this has to be after the postfilter (see below), otherwise we'll get false positives
-          collector = new Collector() {
-            IndexReader reader;
-            int docBase;
-
-            @Override
-            public void setScorer(Scorer scorer) throws IOException {
-              finalCollector.setScorer(scorer);
-            }
-
-            @Override
-            public void setNextReader(IndexReader reader, int docBase) throws IOException {
-              this.reader = reader;
-              this.docBase = docBase;
-
-              finalCollector.setNextReader(reader, docBase);
-            }
-
-            @Override
-            public void collect(int doc) throws IOException {
-              finalCollector.collect(doc);
-
-              setCollectorLock.lock();
-
-              try {
-                set.add(docBase + doc);
-              } finally {
-                setCollectorLock.unlock();
-              }
-            }
-
-            @Override
-            public boolean acceptsDocsOutOfOrder() {
-              return finalCollector.acceptsDocsOutOfOrder();
-            }
-          };
 
           if (pf.postFilter != null) {
             // we have to create a separate post filter here because it's mutable  
@@ -1663,7 +1724,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
       };
 
       try {
-        super.searchParallel(weight, luceneFilter, collectorFactory);
+        searchParallel(weight, luceneFilter, collectorFactory);
       }
       catch( TimeLimitingCollector.TimeExceededException x ) {
         log.warn( "Query: " + query + "; " + x.getMessage() );
@@ -1694,6 +1755,7 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 
       nDocsReturned = topDocs.scoreDocs.length;
 
+      set = cds.docSet();
       assert(totalHits == set.size());
 
       nDocsReturned = topDocs.scoreDocs.length;
@@ -2425,6 +2487,8 @@ class FilterImpl extends Filter {
       }
     }
   }
+
+
 
 }
 
